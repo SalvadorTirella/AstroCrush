@@ -16,6 +16,7 @@
  * ========================================================================== */
 
 import { gsap } from "gsap";
+import { UIManager } from "./ui.js";
 
 /* ========================================================================== *
  * MODULE: Config
@@ -25,7 +26,15 @@ const CONFIG = {
   STAGE: "stage1-engine",
   GRID: { reels: 5, rows: 3 },
   START_BALANCE: 100,
-  BETS: [1, 2, 5, 10, 20, 50],
+  BETS: [1, 2, 5, 10, 20],
+  AUTO_COUNTS: [10, 25, 50, 100, 250, 500],
+  RANK_TITLES: [
+    { max: 1, title: "COSMIC LEGEND" },
+    { max: 5, title: "CELESTIAL MASTER" },
+    { max: 10, title: "ZODIAC ASCENDANT" },
+    { max: 25, title: "STAR WIELDER" },
+    { max: 50, title: "ASTRAL SEEKER" },
+  ],
   MIN_BET: 1,
   WAYS_DIV: 2.5, // units -> credits divisor for 243-ways paytable
   FREE_SPINS: { 3: 8, 4: 12, 5: 20 },
@@ -116,6 +125,7 @@ const EVENTS = {
   CASCADE_FINISHED: "CASCADE_FINISHED", MULTIPLIER_TRIGGERED: "MULTIPLIER_TRIGGERED",
   BONUS_STARTED: "BONUS_STARTED", BONUS_FINISHED: "BONUS_FINISHED", BALANCE_CHANGED: "BALANCE_CHANGED",
   BIG_WIN: "BIG_WIN", AUTO_SPIN_STARTED: "AUTO_SPIN_STARTED", AUTO_SPIN_STOPPED: "AUTO_SPIN_STOPPED",
+  AUTO_SPIN_PROGRESS: "AUTO_SPIN_PROGRESS",
   EXIT_REQUESTED: "EXIT_REQUESTED", LEADERBOARD_QUALIFIED: "LEADERBOARD_QUALIFIED",
   LEADERBOARD_SUBMITTED: "LEADERBOARD_SUBMITTED", ERROR: "ERROR", STATE_CHANGED: "STATE_CHANGED",
   ASCENSION_TRIGGERED: "ASCENSION_TRIGGERED",
@@ -363,6 +373,7 @@ const SettingsManager = (() => {
     masterVol: 0.8, sfxVol: 0.9, musicVol: 0.5, muted: false,
     quality: "AUTO", turbo: false, quick: false,
     reducedMotion: false, showFps: false, betIndex: 1, playerName: "",
+    skipAnimations: false,
   };
   let data = { ...DEFAULTS };
   function load() {
@@ -1596,13 +1607,27 @@ const LeaderboardService = (() => {
     return { ok: true, online: onlineOk, rank: rankOf(score) };
   }
 
-  return { init, fetchTop50, submitScore, qualifies, rankOf, getMode: () => mode };
+  async function getTop50() {
+    try {
+      const { rows, source } = await fetchTop50();
+      return { status: rows.length ? "loaded" : "empty", rows, source };
+    } catch (e) {
+      console.warn("[Leaderboard] getTop50 error", e);
+      return { status: "error", rows: [], source: "local" };
+    }
+  }
+  function titleForRank(rank) {
+    for (const t of CONFIG.RANK_TITLES) if (rank <= t.max) return t.title;
+    return "ASTRAL SEEKER";
+  }
+  return { init, fetchTop50, getTop50, submitScore, qualifies, rankOf, titleForRank, getMode: () => mode };
 })();
 
 /* ========================================================================== *
  * MODULE: UIManager — HUD, overlays, banners (DOM layer above the canvas).
  * ========================================================================== */
-const UIManager = (() => {
+/* Legacy stage-1 UI shell — superseded by src/ui.js (kept inert for reference). */
+const _LegacyUIManager = (() => {
   let root = null;
   const el = {};
   let gameStarted = false;
@@ -2265,9 +2290,14 @@ const UIManager = (() => {
 const AnimationEngine = (() => {
   function timing() {
     const s = SettingsManager.all();
-    if (s.quick) return { scale: 0.18, label: "quick" };
-    if (s.turbo) return { scale: 0.55, label: "turbo" };
+    const auto = AutoSpinManager.isActive() ? AutoSpinManager.cfg() : null;
+    if (s.quick || (auto && auto.quick)) return { scale: 0.18, label: "quick" };
+    if (s.turbo || (auto && auto.turbo)) return { scale: 0.55, label: "turbo" };
     return { scale: 1, label: "normal" };
+  }
+  function skipWins() {
+    const auto = AutoSpinManager.isActive() ? AutoSpinManager.cfg() : null;
+    return !!SettingsManager.get("skipAnimations") || !!(auto && auto.skipWin);
   }
   function reduced() { return SettingsManager.get("reducedMotion"); }
 
@@ -2421,12 +2451,15 @@ const AnimationEngine = (() => {
       if (hasWin) {
         FSM.set("WINNING", `step ${i}`);
         EventBus.emit(EVENTS.WIN_FOUND, { step: i, amount: step.amount, mult: step.mult, wins: ev.wins });
-        await animateWin(step, i, steps.length);
+        const skip = skipWins();
+        if (!skip) await animateWin(step, i, steps.length);
         if (step.mult > 1) {
           EventBus.emit(EVENTS.MULTIPLIER_TRIGGERED, { mult: step.mult });
           SoundManager.play("multiplier");
-          UIManager.showMultiplierBadge(step.mult);
-          await Utils.wait(260 * T.scale);
+          if (!skip) {
+            UIManager.showMultiplierBadge(step.mult);
+            await Utils.wait(260 * T.scale);
+          }
         }
         // apply winnings for this step immediately (balance feedback)
         GameState.addBalance(step.amount);
@@ -2436,10 +2469,17 @@ const AnimationEngine = (() => {
         st.highestMultiplier = Math.max(st.highestMultiplier, step.mult);
         UIManager.updateHUD();
         UIManager.flashChip("balance");
-        const geo = Renderer.frameGeometry();
-        const chip = document.querySelector("#za-balance").getBoundingClientRect();
-        ParticleEngine.coinFlight(geo.ox + geo.gridW / 2, geo.oy + geo.gridH / 2, chip.left + chip.width / 2, chip.top + chip.height / 2, "#ffe9ad", T.label === "quick" ? 3 : 8);
-        UIManager.floatText(`+${step.amount.toLocaleString()}`, geo.ox + geo.gridW / 2 - 24, geo.oy - 30);
+        if (!skip) {
+          const geo = Renderer.frameGeometry();
+          const chipEl = document.querySelector("#za-balance");
+          if (chipEl) {
+            const chip = chipEl.getBoundingClientRect();
+            ParticleEngine.coinFlight(geo.ox + geo.gridW / 2, geo.oy + geo.gridH / 2, chip.left + chip.width / 2, chip.top + chip.height / 2, "#ffe9ad", T.label === "quick" ? 3 : 8);
+          }
+          UIManager.floatText(`+${step.amount.toLocaleString()}`, geo.ox + geo.gridW / 2 - 24, geo.oy - 30);
+        } else {
+          await Utils.wait(110 * T.scale);
+        }
       }
 
       if (step.collapse) {
@@ -2466,10 +2506,12 @@ const AnimationEngine = (() => {
 
     // big win banner
     const bet = outcome.bet || st.currentBet;
+    outcome.bigTier = false;
     if (outcome.totalWin > 0) {
       const ratio = outcome.totalWin / Math.max(1, bet);
       const tier = CONFIG.BIG_WIN_TIERS.find((t) => ratio >= t.mult);
-      if (tier) await animateBigWin(tier.name, outcome.totalWin);
+      outcome.bigTier = !!tier;
+      if (tier && !skipWins()) await animateBigWin(tier.name, outcome.totalWin);
     }
 
     return outcome;
@@ -2543,6 +2585,7 @@ const SpinEngine = (() => {
     chargeAscension(extraCascades + (outcome.scatter ? CONFIG.ASCENSION_PER_SCATTER : 0));
     if (outcome.totalWin > 0) st.totalWins++;
     if (isFree && outcome.fsMultEnd) BonusEngine.state.mult = outcome.fsMultEnd;
+    AutoSpinManager.recordOutcome({ ...outcome, free: isFree });
 
     UIManager.setSpinBusy(false);
     EventBus.emit(EVENTS.SPIN_RESOLVED, {
@@ -2588,7 +2631,7 @@ const SpinEngine = (() => {
 
   function userSpin() {
     if (!UIManager.gameStarted) return;
-    const blocked = ["menu", "gameover", "name", "settings", "board", "paytable", "exit", "pause"];
+    const blocked = ["menu", "gameover", "name", "settings", "board", "paytable", "exit", "pause", "auto", "howto"];
     if (blocked.some((n) => UIManager.isOverlayOpen(n))) return;
     if (FSM.state === "PAUSED") return;
     if (AutoSpinManager.isActive()) { AutoSpinManager.stop(); return; }
@@ -2610,48 +2653,65 @@ const SpinEngine = (() => {
 const AutoSpinManager = (() => {
   let active = false;
   let remaining = 0;
-  let stoppedByBonus = false;
+  let lastOutcome = null;
+  let cfg = {
+    count: 25, turbo: false, quick: false, skipWin: false,
+    stopBelow: 0, stopAbove: 0, stopAfterBonus: true, stopAfterBigWin: false,
+  };
 
-  function start(count) {
+  function start(opts = {}) {
     if (active || !UIManager.gameStarted) return;
     if (!FSM.can("AUTO_SPIN")) return;
+    cfg = { ...cfg, ...opts };
     active = true;
-    remaining = count;
-    stoppedByBonus = false;
+    remaining = cfg.count;
+    lastOutcome = null;
     FSM.set("AUTO_SPIN", "auto start");
-    EventBus.emit(EVENTS.AUTO_SPIN_STARTED, { count });
+    EventBus.emit(EVENTS.AUTO_SPIN_STARTED, { ...cfg });
     UIManager.setSpinBusy(true);
     setTimeout(() => UIManager.setSpinBusy(false), 250);
     tick();
   }
+  function recordOutcome(o) { lastOutcome = o; }
+  function evaluateStops() {
+    const st = GameState.data;
+    if (st.balance < st.currentBet) return "balance";
+    if (cfg.stopBelow > 0 && st.balance < cfg.stopBelow) return "balance-below";
+    if (lastOutcome) {
+      if (cfg.stopAbove > 0 && lastOutcome.totalWin >= cfg.stopAbove) return "win-above";
+      if (cfg.stopAfterBonus && lastOutcome.scatter && !lastOutcome.free) return "bonus";
+      if (cfg.stopAfterBigWin && lastOutcome.bigTier) return "big-win";
+    }
+    return null;
+  }
   async function tick() {
     if (!active) return;
-    const st = GameState.data;
-    if (st.balance < st.currentBet) {
-      stop("balance");
-      GameEngine.triggerGameOver();
+    const stopReason = evaluateStops();
+    if (stopReason) {
+      stop(stopReason);
+      if (stopReason === "balance") GameEngine.triggerGameOver();
       return;
     }
     if (remaining !== Infinity) {
       if (remaining <= 0) { stop("count"); return; }
       remaining--;
     }
+    EventBus.emit(EVENTS.AUTO_SPIN_PROGRESS, { remaining });
     await SpinEngine.spin();
   }
   function onSpinDone() {
-    if (!active) { FSM.set("IDLE", "spin end"); return; }
-    if (BonusEngine.isActive() || stoppedByBonus) return; // bonus interrupts auto
+    if (!active) { if (FSM.can("IDLE")) FSM.set("IDLE", "spin end"); return; }
+    if (BonusEngine.isActive()) return; // bonus pauses auto; it resumes when the bonus ends
     setTimeout(tick, SpinEngine.spinGap());
   }
   function stop(reason = "user") {
     if (!active) return;
     active = false;
-    remaining = 0;
     EventBus.emit(EVENTS.AUTO_SPIN_STOPPED, { reason });
     if (FSM.can("IDLE")) FSM.set("IDLE", `auto stopped (${reason})`);
   }
   return {
-    start, stop, onSpinDone,
+    start, stop, onSpinDone, recordOutcome,
     isActive: () => active,
     pause() { active = false; },
     resumeAuto() {
@@ -2662,6 +2722,7 @@ const AutoSpinManager = (() => {
       return true;
     },
     remaining: () => remaining,
+    cfg: () => ({ ...cfg }),
   };
 })();
 
@@ -2797,8 +2858,8 @@ const GameEngine = (() => {
       if (e.code === "Space") { e.preventDefault(); SoundManager.unlock(); SpinEngine.userSpin(); }
       if (e.key === "Escape") {
         if (UIManager.isOverlayOpen("menu") || UIManager.isOverlayOpen("gameover") || UIManager.isOverlayOpen("name")) return;
-        const anyOpen = ["settings", "board", "paytable", "exit"].some((n) => UIManager.isOverlayOpen(n));
-        if (anyOpen) { ["settings", "board", "paytable", "exit"].forEach((n) => UIManager.closeOverlay(n)); return; }
+        const anyOpen = ["settings", "board", "paytable", "exit", "auto", "howto", "menu"].some((n) => UIManager.isOverlayOpen(n));
+        if (anyOpen) { ["settings", "board", "paytable", "exit", "auto", "howto", "menu"].forEach((n) => UIManager.closeOverlay(n)); return; }
         requestPause();
       }
     };
@@ -2883,6 +2944,11 @@ const GameEngine = (() => {
     UIManager.openOverlay("exit");
     SoundManager.play("ui");
   }
+  function resumeFromExit() {
+    UIManager.closeOverlay("exit");
+    if (FSM.can("IDLE")) FSM.set("IDLE", "exit cancelled");
+    SoundManager.play("ui");
+  }
   function endSession() {
     AutoSpinManager.stop("exit");
     BonusEngine.abort();
@@ -2927,7 +2993,7 @@ const GameEngine = (() => {
 
   const api = {
     version: CONFIG.VERSION,
-    init, destroy, requestPause, resume, requestExit, endSession, newSession, triggerGameOver,
+    init, destroy, requestPause, resume, requestExit, resumeFromExit, endSession, newSession, triggerGameOver,
     get state() { return FSM.state; },
     get ready() { return ready; },
     modules: {
@@ -2946,5 +3012,11 @@ const GameEngine = (() => {
   return api;
 })();
 
-export { GameEngine, CONFIG, EVENTS };
+export {
+  GameEngine, CONFIG, EVENTS, EventBus, Utils, GameState, FSM, SettingsManager,
+  PerformanceManager, LeaderboardService, SoundManager, ParticleEngine, Renderer,
+  SpinEngine, AutoSpinManager, BonusEngine, AnimationEngine, SlotMath, RNG,
+  ReelEngine, DebugTools, StorageService, SYMBOLS, TIER_COLORS, Glyphs, glyphSVG,
+  CONSTELLATIONS,
+};
 export default GameEngine;
