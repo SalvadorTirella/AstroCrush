@@ -779,3 +779,55 @@ input[type="range"].za2-range::-moz-range-thumb { width: 14px; height: 14px; bac
   .za2-rail { display: none; }
   .za2-statusbar { bottom: calc(120px + env(safe-area-inset-bottom)); }
 }
+
+/* ========================================================================== *
+ * ZODIAC ASCENSION cinematic veil (Stage 4)
+ * ========================================================================== */
+.za-asc-veil {
+  position: fixed;
+  inset: 0;
+  z-index: 56;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  pointer-events: none;
+  opacity: 0;
+  background:
+    radial-gradient(ellipse at 50% 42%, rgba(46, 20, 88, 0.55), rgba(3, 4, 20, 0.88) 75%);
+  transition: opacity 0.2s ease;
+}
+.za-asc-veil.is-open { opacity: 1; }
+.za-asc-sign {
+  font-family: var(--f-display);
+  font-weight: 800;
+  font-size: clamp(15px, 2.4vw, 22px);
+  letter-spacing: 0.5em;
+  text-transform: uppercase;
+  color: var(--cyan);
+  text-shadow: 0 0 22px rgba(53, 224, 255, 0.7);
+  opacity: 0;
+}
+.za-asc-kicker {
+  font-family: var(--f-hud);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.6em;
+  text-transform: uppercase;
+  color: var(--gold);
+  text-shadow: 0 0 18px rgba(245, 201, 107, 0.6);
+}
+.za-asc-title {
+  font-family: var(--f-display);
+  font-weight: 900;
+  font-size: clamp(30px, 7vw, 72px);
+  line-height: 1.05;
+  letter-spacing: 0.24em;
+  text-transform: uppercase;
+  text-align: center;
+  color: var(--gold-hi);
+  text-shadow: 0 0 40px rgba(245, 201, 107, 0.75), 0 4px 0 #6d4d1c;
+  opacity: 0;
+  padding: 0 16px;
+}

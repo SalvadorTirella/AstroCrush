@@ -18,6 +18,7 @@
 
 import { gsap } from "gsap";
 import { UIManager } from "./ui.js";
+import { VFX } from "./vfx.js";
 
 /* ========================================================================== *
  * MODULE: Config + Math config (easy to tune)
@@ -686,6 +687,18 @@ const BonusEngine = (() => {
       FSM.set("BONUS", "bonus start");
       EventBus.emit(EVENTS.BONUS_STARTED, { spins: scatter.spins, scatterPay: scatter.pay });
       SoundManager.play("bonus");
+      // Dimension shift: slow, darken, constellation + portal, camera push-in.
+      if (!SettingsManager.get("skipAnimations")) {
+        const reduced = SettingsManager.get("reducedMotion");
+        if (!reduced) {
+          VFX.Camera.zoomTo(1.1, 0.8, "power2.inOut");
+          AmbientFX.hype(4);
+          VFX.ConstellationFX.randomAtBoard(reduced ? 1.2 : 2.2);
+          VFX.BonusFX.portal();
+          await Utils.wait(reduced ? 300 : 900);
+          VFX.Camera.zoomTo(1, 0.6, "power2.out");
+        }
+      }
       await UIManager.showBonusGrant(scatter);
       while (state.remaining > 0) {
         if (!state.active) break;
@@ -833,30 +846,37 @@ const ParticleEngine = (() => {
 /* ========================================================================== *
  * MODULE: AmbientFX — parallax starfield, nebula, planets, meteors.
  * ========================================================================== */
+/* Layered dynamic universe. Decoration uses Math.random (NOT the game RNG)
+   so gameplay reproducibility under DEBUG_SEED is unaffected.
+   Layers (far -> near): deep space base, nebula, distant galaxies, 3 star
+   strata, bright flare stars, stardust, planets + asteroid belts, zodiac
+   constellations (ConstellationEngine), comets, meteors (with fragmentation).
+   hype(): short activity surge after big events. intensity: 0..1 set by
+   PerformanceManager for automatic degradation (never touches math). */
 const AmbientFX = (() => {
-  const layers = [[], [], []];
+  const rnd = Math.random;
+  const layers = [[], [], []]; // distant/mid/near stars
+  const bright = [];           // flare stars
+  const dust = [];             // stardust motes
   const meteors = [];
+  const comets = [];
+  const shards = [];           // meteor fragments
   let nebula = null;
-  let W = 0, H = 0, meteorTimer = 3, t = 0;
+  let galaxyA = null, galaxyB = null;
+  let saturnSprite = null, gasSprite = null, redSprite = null, alienSprite = null, moonSprite = null;
+  let belt = [];
+  let W = 0, H = 0, t = 0;
+  let meteorTimer = 3, cometTimer = 9;
   const pointer = { x: 0.5, y: 0.5 };
-  const QUALITY = { starScale: 1, meteors: true, nebula: true };
+  const QUALITY = { starScale: 1, meteors: true, nebula: true, planets: true, belt: true, comets: true, galaxies: true };
+  let hypeT = 0;      // seconds of hype remaining
+  let intensity = 1;  // 0..1 performance-driven detail level
 
-  function build(w, h) {
-    W = w; H = h;
-    const density = [0.00011, 0.00007, 0.00004];
-    const sizes = [0.9, 1.4, 2.1];
-    for (let l = 0; l < 3; l++) {
-      layers[l] = [];
-      const n = Math.round(w * h * density[l] * QUALITY.starScale);
-      for (let i = 0; i < n; i++) {
-        layers[l].push({
-          x: RNG.float() * w, y: RNG.float() * h, r: sizes[l] * (0.6 + RNG.float() * 0.8),
-          tw: 0.5 + RNG.float() * 2.2, ph: RNG.float() * Math.PI * 2,
-          hue: RNG.float() < 0.16 ? "#ffe9ad" : RNG.float() < 0.4 ? "#9fd8ff" : "#e8ecff",
-        });
-      }
-    }
-    renderNebula();
+  /* ---- sprite pre-rendering (GPU friendly, drawn once) ---- */
+  function makeCanvas(size) {
+    const c = document.createElement("canvas");
+    c.width = c.height = Math.max(2, size);
+    return c;
   }
   function renderNebula() {
     nebula = document.createElement("canvas");
@@ -864,10 +884,11 @@ const AmbientFX = (() => {
     nebula.height = Math.max(2, Math.round(H / 2));
     const c = nebula.getContext("2d");
     const blobs = [
-      { x: 0.28, y: 0.3, r: 0.55, color: "rgba(28,44,110,0.5)" },
-      { x: 0.75, y: 0.22, r: 0.42, color: "rgba(13,79,94,0.36)" },
-      { x: 0.62, y: 0.8, r: 0.5, color: "rgba(64,26,84,0.34)" },
-      { x: 0.15, y: 0.85, r: 0.4, color: "rgba(94,43,22,0.2)" },
+      { x: 0.26, y: 0.28, r: 0.6, color: "rgba(30,26,84,0.55)" },
+      { x: 0.78, y: 0.2, r: 0.45, color: "rgba(13,79,94,0.38)" },
+      { x: 0.6, y: 0.82, r: 0.55, color: "rgba(64,26,84,0.4)" },
+      { x: 0.12, y: 0.86, r: 0.42, color: "rgba(94,43,22,0.22)" },
+      { x: 0.5, y: 0.5, r: 0.7, color: "rgba(46,20,88,0.2)" },
     ];
     for (const b of blobs) {
       const g = c.createRadialGradient(b.x * nebula.width, b.y * nebula.height, 0, b.x * nebula.width, b.y * nebula.height, b.r * nebula.width);
@@ -877,56 +898,314 @@ const AmbientFX = (() => {
       c.fillRect(0, 0, nebula.width, nebula.height);
     }
   }
+  function renderGalaxy(size, hueA, hueB) {
+    const c = makeCanvas(size);
+    const g = c.getContext("2d");
+    const cx = size / 2;
+    const core = g.createRadialGradient(cx, cx, 0, cx, cx, size * 0.5);
+    core.addColorStop(0, hueA);
+    core.addColorStop(0.4, hueB);
+    core.addColorStop(1, "rgba(0,0,0,0)");
+    g.fillStyle = core;
+    g.fillRect(0, 0, size, size);
+    // spiral arms
+    g.save();
+    g.translate(cx, cx);
+    g.globalCompositeOperation = "lighter";
+    for (let arm = 0; arm < 2; arm++) {
+      g.rotate(Math.PI);
+      g.beginPath();
+      for (let a = 0; a < Math.PI * 2.2; a += 0.08) {
+        const r = (a / (Math.PI * 2.2)) * size * 0.44;
+        const x = Math.cos(a) * r, y = Math.sin(a) * r * 0.5;
+        if (a === 0) g.moveTo(x, y); else g.lineTo(x, y);
+      }
+      g.strokeStyle = hueB;
+      g.lineWidth = size * 0.03;
+      g.globalAlpha = 0.5;
+      g.stroke();
+    }
+    g.restore();
+    return c;
+  }
+  function renderPlanet(size, stops, bands, ring) {
+    const pad = ring ? 2.1 : 1.15;
+    const c = makeCanvas(size * pad);
+    const g = c.getContext("2d");
+    const R = size / 2;
+    const cx = c.width / 2, cy = c.height / 2;
+    if (ring) {
+      g.strokeStyle = ring.color;
+      g.lineWidth = R * 0.16;
+      g.globalAlpha = ring.alpha;
+      g.beginPath();
+      g.ellipse(cx, cy, R * 1.85, R * 0.5, -0.35, 0, Math.PI * 2);
+      g.stroke();
+      g.globalAlpha = 1;
+    }
+    const grad = g.createRadialGradient(cx - R * 0.4, cy - R * 0.4, R * 0.1, cx, cy, R);
+    stops.forEach((s, i) => grad.addColorStop(i / (stops.length - 1), s));
+    g.fillStyle = grad;
+    g.beginPath(); g.arc(cx, cy, R, 0, Math.PI * 2); g.fill();
+    if (bands) {
+      g.save();
+      g.beginPath(); g.arc(cx, cy, R, 0, Math.PI * 2); g.clip();
+      g.strokeStyle = bands.color;
+      g.lineWidth = R * 0.1;
+      g.globalAlpha = bands.alpha;
+      for (let i = -2; i <= 2; i++) {
+        g.beginPath();
+        g.ellipse(cx, cy + i * R * 0.3, R * Math.sqrt(Math.max(0.05, 1 - (i * 0.3) ** 2)), R * 0.18, -0.12, 0.25, Math.PI - 0.25);
+        g.stroke();
+      }
+      g.restore();
+    }
+    // limb shadow
+    const sh = g.createRadialGradient(cx + R * 0.5, cy + R * 0.5, R * 0.2, cx, cy, R * 1.1);
+    sh.addColorStop(0, "rgba(0,0,0,0)");
+    sh.addColorStop(0.75, "rgba(0,0,0,0)");
+    sh.addColorStop(1, "rgba(0,0,0,0.55)");
+    g.fillStyle = sh;
+    g.beginPath(); g.arc(cx, cy, R, 0, Math.PI * 2); g.fill();
+    return c;
+  }
+  function renderSprites() {
+    const S = Math.max(64, Math.round(Math.min(W, H) * 0.16));
+    saturnSprite = renderPlanet(S, ["#e8c98a", "#c89a5e", "#7a5530"], null, { color: "rgba(245,201,107,0.5)", alpha: 0.6 });
+    gasSprite = renderPlanet(S, ["#7aa8ff", "#3d5aa8", "#16224d"], { color: "rgba(150,200,255,0.5)", alpha: 0.25 }, null);
+    redSprite = renderPlanet(Math.round(S * 0.7), ["#ff9a6a", "#c85a3a", "#5e2415"], { color: "rgba(120,40,20,0.5)", alpha: 0.3 }, null);
+    alienSprite = renderPlanet(Math.round(S * 0.8), ["#9affd8", "#2e9a7a", "#0e3a30"], { color: "rgba(120,255,220,0.4)", alpha: 0.2 }, null);
+    moonSprite = renderPlanet(Math.round(S * 0.4), ["#f4e7c8", "#b9a878", "#5c5138"], null, null);
+    galaxyA = renderGalaxy(Math.round(S * 1.2), "rgba(200,220,255,0.8)", "rgba(120,90,220,0.25)");
+    galaxyB = renderGalaxy(Math.round(S * 0.9), "rgba(255,230,180,0.7)", "rgba(220,110,160,0.2)");
+  }
+  function buildBelt() {
+    belt = [];
+    const n = Math.round(26 * QUALITY.starScale);
+    for (let i = 0; i < n; i++) {
+      belt.push({
+        a: rnd() * Math.PI * 2,
+        r: 0.95 + rnd() * 0.5,
+        size: 1 + rnd() * 2.4,
+        sp: 0.02 + rnd() * 0.04,
+        tilt: -0.35,
+      });
+    }
+  }
+
+  function build(w, h) {
+    W = w; H = h;
+    const density = [0.00012, 0.00007, 0.00004];
+    const sizes = [0.9, 1.4, 2.1];
+    for (let l = 0; l < 3; l++) {
+      layers[l] = [];
+      const n = Math.round(w * h * density[l] * QUALITY.starScale);
+      for (let i = 0; i < n; i++) {
+        layers[l].push({
+          x: rnd() * w, y: rnd() * h, r: sizes[l] * (0.6 + rnd() * 0.8),
+          tw: 0.5 + rnd() * 2.2, ph: rnd() * Math.PI * 2,
+          hue: rnd() < 0.16 ? "#ffe9ad" : rnd() < 0.4 ? "#9fd8ff" : "#e8ecff",
+        });
+      }
+    }
+    bright.length = 0;
+    const nb = Math.round(14 * QUALITY.starScale);
+    for (let i = 0; i < nb; i++) {
+      bright.push({ x: rnd() * w, y: rnd() * h, r: 1.6 + rnd() * 1.6, ph: rnd() * Math.PI * 2, tw: 0.4 + rnd() * 0.8, hue: rnd() < 0.5 ? "#ffe9ad" : "#bff3ff" });
+    }
+    dust.length = 0;
+    const nd = Math.round(40 * QUALITY.starScale);
+    for (let i = 0; i < nd; i++) {
+      dust.push({ x: rnd() * w, y: rnd() * h, r: 0.5 + rnd() * 1, vx: (rnd() - 0.5) * 6, vy: 2 + rnd() * 6, ph: rnd() * Math.PI * 2 });
+    }
+    renderNebula();
+    renderSprites();
+    buildBelt();
+  }
   function setPointer(nx, ny) { pointer.x = nx; pointer.y = ny; }
+  function setIntensity(v) { intensity = Utils.clamp(v, 0.25, 1); }
+  function hype(seconds = 4) { hypeT = Math.max(hypeT, seconds); }
+
+  function spawnMeteor() {
+    const fromLeft = rnd() < 0.5;
+    meteors.push({
+      x: fromLeft ? -40 : W * (0.4 + rnd() * 0.7), y: -30,
+      vx: (fromLeft ? 1 : -1) * (280 + rnd() * 240),
+      vy: 320 + rnd() * 220,
+      life: 0, maxLife: 1.1, fragmented: false,
+    });
+  }
   function update(dt, paused) {
     if (paused) return;
     t += dt;
+    if (hypeT > 0) hypeT -= dt;
+    const rate = hypeT > 0 ? 0.35 : 1; // during hype meteors spawn far more often
+
     if (QUALITY.meteors) {
-      meteorTimer -= dt;
+      meteorTimer -= dt / rate;
       if (meteorTimer <= 0) {
-        meteorTimer = 4 + RNG.float() * 7;
-        const fromLeft = RNG.float() < 0.5;
-        meteors.push({
-          x: fromLeft ? -40 : W * (0.4 + RNG.float() * 0.7), y: -30,
-          vx: (fromLeft ? 1 : -1) * (260 + RNG.float() * 220),
-          vy: 300 + RNG.float() * 200, life: 0, maxLife: 1.15,
-        });
+        meteorTimer = (4 + rnd() * 7) * (1 / intensity);
+        spawnMeteor();
+      }
+    }
+    if (QUALITY.comets) {
+      cometTimer -= dt;
+      if (cometTimer <= 0) {
+        cometTimer = 12 + rnd() * 14;
+        comets.push({ x: -60, y: H * (0.1 + rnd() * 0.3), vx: 90 + rnd() * 60, vy: 12 + rnd() * 20, life: 0, maxLife: 6 });
       }
     }
     for (let i = meteors.length - 1; i >= 0; i--) {
       const m = meteors[i];
       m.life += dt; m.x += m.vx * dt; m.y += m.vy * dt;
+      const p = m.life / m.maxLife;
+      if (!m.fragmented && p > 0.65) {
+        m.fragmented = true;
+        const n = Math.round(6 * intensity);
+        for (let k = 0; k < n; k++) {
+          shards.push({ x: m.x, y: m.y, vx: m.vx * (0.2 + rnd() * 0.5) + (rnd() - 0.5) * 120, vy: m.vy * (0.2 + rnd() * 0.5) + (rnd() - 0.5) * 60, life: 0, maxLife: 0.5 + rnd() * 0.4, size: 1 + rnd() * 2 });
+        }
+      }
       if (m.life > m.maxLife || m.y > H + 60) meteors.splice(i, 1);
     }
+    for (let i = shards.length - 1; i >= 0; i--) {
+      const s = shards[i];
+      s.life += dt; s.x += s.vx * dt; s.y += s.vy * dt; s.vy += 200 * dt;
+      if (s.life > s.maxLife) shards.splice(i, 1);
+    }
+    for (let i = comets.length - 1; i >= 0; i--) {
+      const c = comets[i];
+      c.life += dt; c.x += c.vx * dt; c.y += c.vy * dt;
+      if (c.life > c.maxLife || c.x > W + 120) comets.splice(i, 1);
+    }
+    for (const d of dust) {
+      d.y += d.vy * dt; d.x += d.vx * dt + Math.sin(t + d.ph) * 4 * dt;
+      if (d.y > H + 4) { d.y = -4; d.x = rnd() * W; }
+      if (d.x > W + 4) d.x = -4; if (d.x < -4) d.x = W + 4;
+    }
   }
+
+  function drawGalaxySprite(ctx, spr, x, y, size, alpha, rot) {
+    if (!spr || !QUALITY.galaxies) return;
+    ctx.save();
+    ctx.globalAlpha = alpha * intensity;
+    ctx.translate(x, y);
+    ctx.rotate(rot);
+    ctx.drawImage(spr, -size / 2, -size / 2, size, size);
+    ctx.restore();
+  }
+  function drawSprite(ctx, spr, x, y, size) {
+    if (!spr) return;
+    ctx.drawImage(spr, x - size / 2, y - size / 2, size, size);
+  }
+  function drawBelt(ctx, cx, cy, baseR) {
+    if (!QUALITY.belt) return;
+    ctx.save();
+    ctx.fillStyle = "rgba(160,170,210,0.5)";
+    for (const b of belt) {
+      const a = b.a + t * b.sp;
+      const x = cx + Math.cos(a) * baseR * b.r;
+      const y = cy + Math.sin(a) * baseR * b.r * 0.32;
+      ctx.globalAlpha = 0.25 + 0.3 * Math.abs(Math.sin(a));
+      ctx.beginPath(); ctx.arc(x, y, b.size, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.restore();
+  }
+
   function draw(ctx) {
+    // deep space base + nebula
     if (nebula && QUALITY.nebula) {
       ctx.save();
-      ctx.globalAlpha = 0.9;
+      ctx.globalAlpha = 0.9 * intensity;
       ctx.drawImage(nebula, 0, 0, W, H);
       ctx.restore();
     }
     const px = (pointer.x - 0.5), py = (pointer.y - 0.5);
+
+    // distant galaxies (very slow parallax)
+    drawGalaxySprite(ctx, galaxyA, W * 0.82 - px * 3, H * 0.16 - py * 2, Math.min(W, H) * 0.22, 0.5, t * 0.01);
+    drawGalaxySprite(ctx, galaxyB, W * 0.12 - px * 4, H * 0.62 - py * 2, Math.min(W, H) * 0.14, 0.4, -t * 0.008);
+
+    // star strata with parallax + twinkle + drift
     const depths = [5, 11, 20];
+    const hypeBoost = hypeT > 0 ? 1.35 : 1;
     for (let l = 0; l < 3; l++) {
       const drift = t * (1.2 + l * 1.4);
       for (const s of layers[l]) {
         const x = (((s.x - px * depths[l] - drift) % W) + W) % W;
         const y = (((s.y - py * depths[l] * 0.5 + drift * 0.35) % H) + H) % H;
         const tw = 0.55 + 0.45 * Math.sin(t * s.tw + s.ph);
-        ctx.globalAlpha = (0.28 + l * 0.2) * tw;
+        ctx.globalAlpha = (0.28 + l * 0.2) * tw * intensity * hypeBoost;
         ctx.fillStyle = s.hue;
         ctx.beginPath(); ctx.arc(x, y, s.r, 0, Math.PI * 2); ctx.fill();
       }
     }
+    // bright flare stars (cross flare)
+    ctx.globalCompositeOperation = "lighter";
+    for (const b of bright) {
+      const x = (((b.x - px * 26) % W) + W) % W;
+      const y = (((b.y - py * 13) % H) + H) % H;
+      const tw = 0.5 + 0.5 * Math.sin(t * b.tw + b.ph);
+      const r = b.r * (0.8 + tw * 0.5);
+      ctx.globalAlpha = 0.5 * tw * intensity * hypeBoost;
+      ctx.fillStyle = b.hue;
+      ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+      // flare spikes
+      ctx.globalAlpha = 0.28 * tw * intensity;
+      ctx.strokeStyle = b.hue;
+      ctx.lineWidth = 1;
+      const fl = r * 5;
+      ctx.beginPath();
+      ctx.moveTo(x - fl, y); ctx.lineTo(x + fl, y);
+      ctx.moveTo(x, y - fl); ctx.lineTo(x, y + fl);
+      ctx.stroke();
+    }
+    ctx.globalCompositeOperation = "source-over";
+    // stardust
+    ctx.globalAlpha = 0.35 * intensity;
+    ctx.fillStyle = "#cfe0ff";
+    for (const d of dust) {
+      const tw = 0.5 + 0.5 * Math.sin(t * 2 + d.ph);
+      ctx.globalAlpha = 0.25 * tw * intensity;
+      ctx.beginPath(); ctx.arc(d.x, d.y, d.r, 0, Math.PI * 2); ctx.fill();
+    }
     ctx.globalAlpha = 1;
-    drawPlanet(ctx, W * 0.1, H * 0.8 + Math.sin(t * 0.4) * 5, Math.min(W, H) * 0.1);
-    drawMoon(ctx, W * 0.9, H * 0.14 + Math.sin(t * 0.3 + 2) * 4, Math.min(W, H) * 0.032);
+
+    // planets + belts (slow bob + parallax)
+    if (QUALITY.planets) {
+      const u = Math.min(W, H);
+      const satR = u * 0.115, gasR = u * 0.085, redR = u * 0.05, alienR = u * 0.06, moonR = u * 0.032;
+      const satX = W * 0.1 - px * 14, satY = H * 0.8 + Math.sin(t * 0.35) * 6 - py * 8;
+      drawBelt(ctx, satX, satY, satR * 1.4);
+      drawSprite(ctx, saturnSprite, satX, satY, satR * 2.1);
+      drawSprite(ctx, gasSprite, W * 0.92 - px * 10, H * 0.62 + Math.sin(t * 0.28 + 1) * 5 - py * 6, gasR * 1.15);
+      drawSprite(ctx, redSprite, W * 0.24 - px * 18, H * 0.14 + Math.sin(t * 0.4 + 2) * 4 - py * 10, redR * 1.15);
+      drawSprite(ctx, alienSprite, W * 0.72 - px * 22, H * 0.1 + Math.sin(t * 0.3 + 3) * 5 - py * 12, alienR * 1.15);
+      drawSprite(ctx, moonSprite, W * 0.9 - px * 30, H * 0.32 + Math.sin(t * 0.5 + 4) * 4 - py * 14, moonR * 1.15);
+    }
+
+    // comets (long curved tail)
+    for (const c of comets) {
+      const a = Math.min(1, c.life / 0.6) * (1 - Math.max(0, (c.life - c.maxLife + 1)));
+      const len = 150;
+      const sp = Math.hypot(c.vx, c.vy);
+      const nx = c.x - (c.vx / sp) * len, ny = c.y - (c.vy / sp) * len;
+      const g = ctx.createLinearGradient(c.x, c.y, nx, ny);
+      g.addColorStop(0, `rgba(200,240,255,${0.5 * a})`);
+      g.addColorStop(1, "rgba(120,90,220,0)");
+      ctx.strokeStyle = g;
+      ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(c.x, c.y); ctx.quadraticCurveTo((c.x + nx) / 2, (c.y + ny) / 2 - 14, nx, ny); ctx.stroke();
+      ctx.fillStyle = `rgba(230,250,255,${0.8 * a})`;
+      ctx.beginPath(); ctx.arc(c.x, c.y, 3, 0, Math.PI * 2); ctx.fill();
+    }
+
+    // meteors + fragments
     for (const m of meteors) {
       const a = 1 - m.life / m.maxLife;
       const len = 90;
-      const nx = m.x - (m.vx / Math.hypot(m.vx, m.vy)) * len;
-      const ny = m.y - (m.vy / Math.hypot(m.vx, m.vy)) * len;
+      const sp = Math.hypot(m.vx, m.vy);
+      const nx = m.x - (m.vx / sp) * len, ny = m.y - (m.vy / sp) * len;
       const g = ctx.createLinearGradient(m.x, m.y, nx, ny);
       g.addColorStop(0, `rgba(255,240,200,${0.85 * a})`);
       g.addColorStop(0.35, `rgba(53,224,255,${0.4 * a})`);
@@ -934,40 +1213,24 @@ const AmbientFX = (() => {
       ctx.strokeStyle = g;
       ctx.lineWidth = 2.2;
       ctx.beginPath(); ctx.moveTo(m.x, m.y); ctx.lineTo(nx, ny); ctx.stroke();
+      ctx.fillStyle = `rgba(255,250,230,${a})`;
+      ctx.beginPath(); ctx.arc(m.x, m.y, 2.4, 0, Math.PI * 2); ctx.fill();
     }
-  }
-  function drawPlanet(ctx, x, y, r) {
-    ctx.save();
-    const g = ctx.createRadialGradient(x - r * 0.4, y - r * 0.4, r * 0.1, x, y, r);
-    g.addColorStop(0, "#3d5aa8"); g.addColorStop(0.55, "#1c2c66"); g.addColorStop(1, "#0a102f");
-    ctx.fillStyle = g;
-    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
-    ctx.strokeStyle = "rgba(53,224,255,0.13)";
-    ctx.lineWidth = r * 0.09;
-    for (let i = -2; i <= 2; i++) {
-      ctx.beginPath();
-      ctx.ellipse(x, y + i * r * 0.28, r * Math.sqrt(Math.max(0.05, 1 - (i * 0.28) ** 2)), r * 0.16, -0.18, 0.3, Math.PI - 0.3);
-      ctx.stroke();
+    ctx.globalCompositeOperation = "lighter";
+    for (const s of shards) {
+      const a = 1 - s.life / s.maxLife;
+      ctx.globalAlpha = 0.7 * a;
+      ctx.fillStyle = "#ffd98a";
+      ctx.beginPath(); ctx.arc(s.x, s.y, s.size, 0, Math.PI * 2); ctx.fill();
     }
-    ctx.strokeStyle = "rgba(245,201,107,0.3)";
-    ctx.lineWidth = r * 0.07;
-    ctx.beginPath();
-    ctx.ellipse(x, y, r * 1.65, r * 0.42, -0.35, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.restore();
+    ctx.globalCompositeOperation = "source-over";
+    ctx.globalAlpha = 1;
   }
-  function drawMoon(ctx, x, y, r) {
-    ctx.save();
-    const g = ctx.createRadialGradient(x - r * 0.35, y - r * 0.35, r * 0.1, x, y, r);
-    g.addColorStop(0, "#f4e7c8"); g.addColorStop(0.7, "#b9a878"); g.addColorStop(1, "#5c5138");
-    ctx.fillStyle = g;
-    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = "rgba(60,50,30,0.35)";
-    ctx.beginPath(); ctx.arc(x + r * 0.25, y - r * 0.15, r * 0.2, 0, Math.PI * 2); ctx.fill();
-    ctx.beginPath(); ctx.arc(x - r * 0.2, y + r * 0.3, r * 0.14, 0, Math.PI * 2); ctx.fill();
-    ctx.restore();
-  }
-  return { build, update, draw, setPointer, QUALITY, get t() { return t; } };
+
+  return {
+    build, update, draw, setPointer, setIntensity, hype, QUALITY,
+    get t() { return t; },
+  };
 })();
 
 /* ========================================================================== *
@@ -975,6 +1238,7 @@ const AmbientFX = (() => {
  * ========================================================================== */
 const ConstellationEngine = (() => {
   const flashes = [];
+  const cinemas = []; // full draw sequences
   const ambient = [];
   let W = 0, H = 0;
   function build(w, h) {
@@ -997,6 +1261,15 @@ const ConstellationEngine = (() => {
     Utils.tween(f, { alpha: 1, duration: 0.25, ease: "power2.out" }).then(() =>
       Utils.tween(f, { alpha: 0, duration: 1.4, delay: 0.9, ease: "power1.inOut" })
     );
+  }
+  /* Full staged sequence. Progress p drives:
+     0.0-0.25 stars appear+glow, 0.25-0.65 lines connect progressively,
+     0.65-0.8 figure complete + glow, 0.8-0.9 energy pulse, 0.9-1 fade. */
+  function cinematic(id, x, y, size, dur = 2.6) {
+    if (!CONSTELLATIONS[id]) return Promise.resolve();
+    const c = { id, x, y, size, p: 0, alpha: 1, done: false };
+    cinemas.push(c);
+    return Utils.tween(c, { p: 1, duration: dur, ease: "none" }).then(() => { c.done = true; });
   }
   function drawMap(ctx, id, x, y, size, alpha, color) {
     const map = CONSTELLATIONS[id];
@@ -1021,6 +1294,60 @@ const ConstellationEngine = (() => {
     }
     ctx.restore();
   }
+  function drawCinema(ctx, c, t) {
+    const map = CONSTELLATIONS[c.id];
+    if (!map) return;
+    const p = c.p;
+    const fadeIn = Utils.clamp(p / 0.25, 0, 1);
+    const fadeOut = p > 0.9 ? 1 - (p - 0.9) / 0.1 : 1;
+    const alpha = c.alpha * fadeIn * fadeOut;
+    const starPhase = Utils.clamp((p - 0.0) / 0.3, 0, 1);
+    const linePhase = Utils.clamp((p - 0.25) / 0.4, 0, 1);
+    const glowPhase = p > 0.65 ? Math.sin(((p - 0.65) / 0.35) * Math.PI) : 0;
+    ctx.save();
+    // progressive line connection
+    const totalLines = map.lines.length;
+    const linesToDraw = Math.floor(linePhase * totalLines);
+    if (linesToDraw > 0) {
+      ctx.strokeStyle = "rgba(255,233,173,0.85)";
+      ctx.lineWidth = 1.2 + glowPhase * 1.4;
+      ctx.shadowColor = "#ffe9ad";
+      ctx.shadowBlur = 6 + glowPhase * 18;
+      ctx.beginPath();
+      for (let i = 0; i < linesToDraw; i++) {
+        const [a, b] = map.lines[i];
+        ctx.moveTo(c.x + map.pts[a][0] * c.size, c.y + map.pts[a][1] * c.size);
+        ctx.lineTo(c.x + map.pts[b][0] * c.size, c.y + map.pts[b][1] * c.size);
+      }
+      ctx.globalAlpha = alpha;
+      ctx.stroke();
+    }
+    // stars
+    ctx.shadowBlur = 0;
+    map.pts.forEach(([px, py], i) => {
+      const appear = Utils.clamp(starPhase * map.pts.length - i, 0, 1);
+      if (appear <= 0) return;
+      const sx = c.x + px * c.size, sy = c.y + py * c.size;
+      const tw = 0.7 + 0.3 * Math.sin(t * 6 + i * 1.7);
+      const r = (2.2 + glowPhase * 2.4) * appear * tw;
+      ctx.globalAlpha = alpha * appear;
+      ctx.fillStyle = "#ffe9ad";
+      ctx.shadowColor = "#ffe9ad";
+      ctx.shadowBlur = 8 + glowPhase * 22;
+      ctx.beginPath(); ctx.arc(sx, sy, r, 0, Math.PI * 2); ctx.fill();
+    });
+    // energy pulse ring
+    if (p > 0.8 && p < 0.9) {
+      const rp = (p - 0.8) / 0.1;
+      ctx.globalAlpha = alpha * (1 - rp) * 0.8;
+      ctx.strokeStyle = "#35e0ff";
+      ctx.lineWidth = 2.5;
+      ctx.beginPath();
+      ctx.arc(c.x + c.size / 2, c.y + c.size / 2, rp * c.size * 0.9, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
   function draw(ctx, t) {
     for (const a of ambient) {
       const tw = 0.06 + 0.04 * Math.sin(t * 0.6 + a.ph);
@@ -1032,8 +1359,12 @@ const ConstellationEngine = (() => {
       if (f.alpha <= 0.01 && f.phase > 0.3) flashes.splice(i, 1);
       f.phase += 0.016;
     }
+    for (let i = cinemas.length - 1; i >= 0; i--) {
+      drawCinema(ctx, cinemas[i], t);
+      if (cinemas[i].done) cinemas.splice(i, 1);
+    }
   }
-  return { build, flash, draw };
+  return { build, flash, cinematic, draw };
 })();
 
 /* ========================================================================== *
@@ -1044,7 +1375,9 @@ const Renderer = (() => {
   let W = 0, H = 0, dpr = 1;
   const layout = { ox: 0, oy: 0, cell: 80, gridW: 0, gridH: 0, frameX: 0, frameY: 0, frameW: 0, frameH: 0 };
   let shake = 0;
+  let camera = null; // injected by GameEngine (VFX.Camera.cam)
   const qual = { glow: true, blur: true };
+  function setCamera(cam) { camera = cam; }
 
   function init(c) { canvas = c; ctx = c.getContext("2d"); }
   function resize() {
@@ -1247,6 +1580,15 @@ const Renderer = (() => {
     ctx.fillRect(0, 0, W, H);
 
     ctx.save();
+    // camera: zoom around board center + drift + shake
+    const cx = layout.ox + layout.gridW / 2;
+    const cy = layout.oy + layout.gridH / 2;
+    const zoom = camera ? camera.zoom : 1;
+    if (camera && (zoom !== 1 || camera.x || camera.y)) {
+      ctx.translate(cx + (camera.x || 0), cy + (camera.y || 0));
+      ctx.scale(zoom, zoom);
+      ctx.translate(-cx, -cy);
+    }
     if (shake > 0.1) {
       ctx.translate((RNG.float() - 0.5) * shake, (RNG.float() - 0.5) * shake);
       shake *= 0.86;
@@ -1262,10 +1604,28 @@ const Renderer = (() => {
     v.addColorStop(1, "rgba(2,3,14,0.6)");
     ctx.fillStyle = v;
     ctx.fillRect(0, 0, W, H);
+
+    // impact flash overlay (bloom-like)
+    if (camera && camera.flash > 0.01) {
+      ctx.fillStyle = `rgba(${camera.flashColor},${camera.flash * 0.5})`;
+      ctx.fillRect(0, 0, W, H);
+    }
+    // radial burst ring
+    if (camera && camera.burst > 0.01) {
+      const bp = 1 - camera.burst; // 0 -> 1 as burst decays
+      ctx.save();
+      ctx.globalAlpha = camera.burst * 0.5;
+      ctx.strokeStyle = "#ffe9ad";
+      ctx.lineWidth = 3 + bp * 6;
+      ctx.beginPath();
+      ctx.arc(cx, cy, bp * Math.max(W, H) * 0.55, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+    }
   }
 
   return {
-    init, resize, draw, cellCenter, addShake, frameGeometry,
+    init, resize, draw, cellCenter, addShake, frameGeometry, setCamera,
     get W() { return W; }, get H() { return H; },
     setQuality(q) { qual.glow = q.glow; qual.blur = q.blur; },
   };
@@ -1276,9 +1636,9 @@ const Renderer = (() => {
  * ========================================================================== */
 const PerformanceManager = (() => {
   const PRESETS = {
-    HIGH: { particleCap: 420, starScale: 1, dprCap: 2, glow: true, blur: true, meteors: true, nebula: true },
-    MEDIUM: { particleCap: 230, starScale: 0.7, dprCap: 1.5, glow: true, blur: true, meteors: true, nebula: true },
-    LOW: { particleCap: 110, starScale: 0.45, dprCap: 1, glow: false, blur: false, meteors: false, nebula: true },
+    HIGH: { particleCap: 420, starScale: 1, dprCap: 2, glow: true, blur: true, meteors: true, nebula: true, planets: true, belt: true, comets: true, galaxies: true },
+    MEDIUM: { particleCap: 230, starScale: 0.7, dprCap: 1.5, glow: true, blur: true, meteors: true, nebula: true, planets: true, belt: true, comets: true, galaxies: true },
+    LOW: { particleCap: 110, starScale: 0.45, dprCap: 1, glow: false, blur: false, meteors: false, nebula: true, planets: true, belt: false, comets: false, galaxies: false },
   };
   let current = { name: "AUTO", ...PRESETS.HIGH };
   let fps = 60, acc = 0, frames = 0, autoTimer = 0;
@@ -1296,6 +1656,10 @@ const PerformanceManager = (() => {
     AmbientFX.QUALITY.starScale = current.starScale;
     AmbientFX.QUALITY.meteors = current.meteors;
     AmbientFX.QUALITY.nebula = current.nebula;
+    AmbientFX.QUALITY.planets = current.planets;
+    AmbientFX.QUALITY.belt = current.belt;
+    AmbientFX.QUALITY.comets = current.comets;
+    AmbientFX.QUALITY.galaxies = current.galaxies;
     Renderer.setQuality(current);
     if (GameEngine.ready) Renderer.resize();
     return current;
@@ -1498,9 +1862,12 @@ const AnimationEngine = (() => {
       await Utils.tween(col, { spinSpeed: 0, duration: 0.3 * T.scale, ease: "power3.out" });
       col.mode = "idle";
       col.cells = grid[c].map((sym, r) => ({ sym, row: r, off: -Renderer.frameGeometry().cell * 0.7, scale: 1, alpha: 1, glow: 0 }));
-      for (const cl of col.cells) Utils.tween(cl, { off: 0, duration: 0.3 * T.scale, ease: "back.out(2.2)" });
+      // overshoot + settle, staggered per cell for a physical feel
+      col.cells.forEach((cl, r) => Utils.tween(cl, { off: 0, duration: (0.28 + r * 0.02) * T.scale, ease: "back.out(2.2)", delay: r * 0.012 * T.scale }));
       SoundManager.play("reelStop", c);
-      if (!reduced()) Renderer.addShake(2);
+      const isLast = c === ReelEngine.reels - 1;
+      if (!reduced()) Renderer.addShake(isLast ? 3 : 2);
+      if (isLast && !reduced()) VFX.Camera.impactFlash("159,216,255", 0.16);
       landedScatters += grid[c].filter((s) => s === "scatter").length;
       EventBus.emit(EVENTS.REEL_STOPPED, { reel: c });
     }
@@ -1518,22 +1885,36 @@ const AnimationEngine = (() => {
     }
     const size = step.amount >= 10 * GameState.data.currentBet ? 3 : step.amount >= 4 * GameState.data.currentBet ? 2 : 1;
     SoundManager.play("win", size);
+    // glow pulse + scale anticipation on the whole cluster
     const pulse = { v: 0 };
     const pulseUp = Utils.tween(pulse, {
       v: 1, duration: 0.24 * T.scale, ease: "power2.out", repeat: T.label === "quick" ? 0 : 2, yoyo: true,
       onUpdate: () => { for (const cl of cells) cl.glow = pulse.v; },
     });
+    if (!reduced()) {
+      for (const cl of cells) {
+        Utils.tween(cl, { scale: 1.14, duration: 0.16 * T.scale, ease: "power2.out", yoyo: true, repeat: T.label === "quick" ? 0 : 1 });
+      }
+    }
     const geo = Renderer.frameGeometry();
-    for (const key of ev.winCells) {
-      const [c, r] = key.split(",").map(Number);
-      const p = Renderer.cellCenter(c, r);
-      const def = SYMBOL_BY_ID[step.grid[c][r]];
-      ParticleEngine.burst(p.x, p.y, (def && def.color) || "#ffe9ad", 7, { speed: 130, life: 0.7 });
+    for (const w of ev.wins) {
+      const def = SYMBOL_BY_ID[w.symbol];
+      const color = (def && def.color) || "#ffe9ad";
+      for (const [c, r] of w.cells) {
+        const p = Renderer.cellCenter(c, r);
+        VFX.WinFX.sparkle(p.x, p.y, color, size >= 2 ? 12 : 7);
+      }
+      if (size >= 2 && w.cells.length) {
+        const [mc, mr] = w.cells[Math.floor(w.cells.length / 2)];
+        const mp = Renderer.cellCenter(mc, mr);
+        VFX.WinFX.ring(mp.x, mp.y, color);
+      }
     }
     const flashId = CONSTELLATION_IDS[RNG.int(CONSTELLATION_IDS.length)];
     ConstellationEngine.flash(flashId, geo.ox + geo.gridW * 0.5 - geo.cell * 1.2, geo.oy - geo.cell * 0.05, geo.cell * 2.4);
+    if (size >= 3 && !reduced()) VFX.Camera.zoomPulse(1.04, 0.5);
     await pulseUp;
-    for (const cl of cells) cl.glow = 0;
+    for (const cl of cells) { cl.glow = 0; cl.scale = 1; }
   }
 
   async function animateCascade(step) {
@@ -1557,13 +1938,25 @@ const AnimationEngine = (() => {
     for (let c = 0; c < ReelEngine.reels; c++) {
       const col = ReelEngine.view[c];
       const colMoves = moves.filter((m) => m.col === c).sort((a, b) => a.toRow - b.toRow);
+      const colDelay = (c % 2 === 0 ? 0 : 0.03) * T.scale; // small per-column stagger
       col.cells = colMoves.map((m) => ({
         sym: m.symbol, row: m.toRow,
         off: -(m.fall + (m.spawned ? 1.2 : 0)) * geo.cell,
-        scale: 1, alpha: 1, glow: 0,
+        // spawned symbols enter small & transparent, then overshoot-settle
+        scale: m.spawned && !reduced() ? 0.75 : 1,
+        alpha: m.spawned && !reduced() ? 0 : 1,
+        glow: 0,
       }));
-      for (const cl of col.cells) {
-        Utils.tween(cl, { off: 0, duration: (0.3 + 0.03 * cl.row) * T.scale, ease: "bounce.out" });
+      col.cells.forEach((cl) => {
+        Utils.tween(cl, { off: 0, duration: (0.3 + 0.03 * cl.row) * T.scale, ease: "bounce.out", delay: colDelay });
+        if (cl.alpha === 0) Utils.tween(cl, { alpha: 1, scale: 1, duration: 0.24 * T.scale, ease: "back.out(2)", delay: colDelay + 0.05 * T.scale });
+      });
+    }
+    // landing dust on the bottom row
+    if (!reduced()) {
+      for (let c = 0; c < ReelEngine.reels; c++) {
+        const p = Renderer.cellCenter(c, ReelEngine.rows - 1);
+        ParticleEngine.stardust(p.x, p.y + geo.cell * 0.35, "#8fa7c9", 2);
       }
     }
     await Utils.wait(380 * T.scale);
@@ -1574,15 +1967,22 @@ const AnimationEngine = (() => {
     EventBus.emit(EVENTS.BIG_WIN, { tier: tierName, amount });
     SoundManager.play("bigWin");
     const geo = Renderer.frameGeometry();
-    for (let i = 0; i < 5; i++) {
-      ParticleEngine.burst(
-        geo.ox + RNG.float() * geo.gridW,
-        geo.oy + RNG.float() * geo.gridH,
-        ["#ffe9ad", "#35e0ff", "#ff4fd8", "#7dffa8"][RNG.int(4)],
-        16, { speed: 220, life: 1.1 }
-      );
+    // tier magnitude drives the spectacle (math/payout are unaffected)
+    const mag = tierName === "COSMIC WIN" ? 4 : tierName === "EPIC WIN" ? 3 : tierName === "MEGA WIN" ? 2 : 1;
+    if (!reduced()) {
+      VFX.CosmicFX.explosion(20 * mag);
+      VFX.CosmicFX.lightBurst();
+      VFX.Camera.radialBurst(0.6 + mag * 0.25);
+      VFX.Camera.zoomPulse(1.04 + mag * 0.015, 0.7);
+      VFX.Camera.impactFlash("255,233,173", 0.3 + mag * 0.12);
+      AmbientFX.hype(2 + mag); // temporarily raise cosmic activity
+      Renderer.addShake(4 + mag * 2);
+      if (mag >= 3) VFX.ConstellationFX.randomAtBoard(2.2);
+      if (mag >= 4) VFX.MeteorFX.streak();
+    } else {
+      Renderer.addShake(3);
     }
-    if (!reduced()) Renderer.addShake(6);
+    // count-up banner (UIManager animates from previous to final value)
     await UIManager.showBanner(tierName, amount);
   }
 
@@ -1630,6 +2030,12 @@ const AnimationEngine = (() => {
           EventBus.emit(EVENTS.MULTIPLIER_TRIGGERED, { mult: step.mult });
           SoundManager.play("multiplier");
           if (!skip) {
+            const geoM = Renderer.frameGeometry();
+            const orbX = geoM.ox + geoM.gridW / 2, orbY = geoM.oy + geoM.cell * 0.5;
+            if (!reduced()) {
+              VFX.MultiplierFX.orb(orbX, orbY, step.mult >= 25 ? "#ff4fd8" : step.mult >= 10 ? "#ffe9ad" : "#35e0ff");
+              VFX.Camera.zoomPulse(1.03, 0.35);
+            }
             UIManager.showMultiplierBadge(step.mult);
             await Utils.wait(260 * T.scale);
           }
@@ -1778,8 +2184,8 @@ const SpinEngine = (() => {
       st.ascensionArmed = true;
       st.ascensionCharge = 0;
       st.zodiacAscensionCount++;
+      // The full ZODIAC ASCENSION cinematic plays on this event (VFX layer).
       EventBus.emit(EVENTS.ASCENSION_TRIGGERED, { count: st.zodiacAscensionCount });
-      AnimationEngine.animateAscension();
     }
     UIManager.updateAscension();
   }
@@ -2164,9 +2570,20 @@ const GameEngine = (() => {
     ReelEngine.setGrid(SlotMath.generateGrid()); // idle attract grid (visual only)
     DebugTools.build(container);
     Renderer.resize();
+    Renderer.setCamera(VFX.Camera.cam);
 
     cleanups.push(EventBus.on(EVENTS.BALANCE_CHANGED, () => UIManager.updateHUD()));
     cleanups.push(EventBus.on(EVENTS.ERROR, (e) => console.warn("[Game]", e)));
+
+    // VFX event wiring — pure presentation, math already resolved upstream.
+    cleanups.push(EventBus.on(EVENTS.ASCENSION_TRIGGERED, (p) => {
+      VFX.Ascension.play({ magnitude: Math.min(4, 2 + ((p && p.count) || 1) % 3) });
+    }));
+    cleanups.push(EventBus.on(EVENTS.BIG_WIN, (p) => {
+      const mag = p && p.tier === "COSMIC WIN" ? 4 : p && p.tier === "EPIC WIN" ? 3 : 2;
+      AmbientFX.hype(2 + mag);
+    }));
+    cleanups.push(EventBus.on(EVENTS.BONUS_STARTED, () => AmbientFX.hype(4)));
 
     const onKey = (e) => {
       if (e.ctrlKey && e.shiftKey && (e.key === "D" || e.key === "d")) { e.preventDefault(); DebugTools.toggle(); return; }
@@ -2208,7 +2625,11 @@ const GameEngine = (() => {
       last = now;
       const paused = FSM.state === "PAUSED";
       PerformanceManager.tick(dt);
+      // Auto-degrade ambient detail by measured FPS (never touches math).
+      const fpsNow = PerformanceManager.fps();
+      AmbientFX.setIntensity(fpsNow >= 50 ? 1 : fpsNow >= 38 ? 0.72 : 0.45);
       if (!paused) {
+        VFX.Camera.update(dt);
         ReelEngine.integrate(dt);
         AmbientFX.update(dt, false);
         ParticleEngine.update(dt);
@@ -2296,6 +2717,8 @@ const GameEngine = (() => {
     for (const fn of cleanups) { try { fn(); } catch { /* noop */ } }
     cleanups.length = 0;
     DebugTools.destroy();
+    VFX.Ascension.destroy();
+    VFX.Camera.reset();
     EventBus.clear();
     SoundManager.stopAmbient();
     if (rootEl) rootEl.innerHTML = "";
@@ -2312,7 +2735,7 @@ const GameEngine = (() => {
       CONFIG, EventBus, EVENTS, RNG, SlotMath, WinEvaluator, CascadeEngine, MultiplierEngine,
       BonusEngine, GameState, FSM, SpinEngine, ReelEngine, AnimationEngine, ParticleEngine,
       AmbientFX, ConstellationEngine, Renderer, SoundManager, UIManager, SettingsManager,
-      AutoSpinManager, StorageService, LeaderboardService, PerformanceManager, DebugTools,
+      AutoSpinManager, StorageService, LeaderboardService, PerformanceManager, DebugTools, VFX,
     },
     debug: {
       addCredits: (n) => GameState.addBalance(n),
@@ -2332,4 +2755,5 @@ export {
   SoundManager, AnimationEngine, SpinEngine, AutoSpinManager, LeaderboardService, DebugTools,
   GameEngine,
 };
+export { VFX };
 export default GameEngine;
