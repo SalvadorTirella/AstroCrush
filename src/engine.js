@@ -1,16 +1,17 @@
 /* ============================================================================
- * ZODIAC ASCENSION — Game Engine
- * Stage 1: Architecture, engine and foundations.
+ * ZODIAC ASCENSION — Game Engine (Stages 1-3)
  *
- * Logical modules (single bundle, clear boundaries):
- *   Config · Utils · EventBus · RNG · SlotMath · WinEvaluator · CascadeEngine
- *   MultiplierEngine · BonusEngine · GameState · GameStateMachine · SpinEngine
- *   ReelEngine · AnimationEngine · ParticleEngine · AmbientFX
- *   ConstellationEngine · Renderer · SoundManager · UIManager
- *   SettingsManager · AutoSpinManager · StorageService · LeaderboardService
+ * Logical modules:
+ *   Config · Utils · EventBus · RNG · Glyphs/Symbols · StorageService
+ *   SettingsManager · GameState · GameStateMachine · SlotMath(cluster pays)
+ *   WinEvaluator · CascadeEngine · MultiplierEngine · BonusEngine · ReelEngine
+ *   ParticleEngine · AmbientFX · ConstellationEngine · Renderer · SoundManager
+ *   AnimationEngine · SpinEngine · AutoSpinManager · LeaderboardService
  *   PerformanceManager · DebugTools · GameEngine
+ * The professional UI (HUD, modals, flows) lives in src/ui.js and is imported
+ * here as UIManager. It never touches math.
  *
- * Pipeline contract (math is fully decoupled from presentation):
+ * Pipeline contract (math fully decoupled from presentation):
  *   RNG -> Spin Result (full cascade chain precomputed) -> GameState
  *       -> Win Evaluation -> Animation. Never the reverse.
  * ========================================================================== */
@@ -19,14 +20,40 @@ import { gsap } from "gsap";
 import { UIManager } from "./ui.js";
 
 /* ========================================================================== *
- * MODULE: Config
+ * MODULE: Config + Math config (easy to tune)
  * ========================================================================== */
 const CONFIG = {
-  VERSION: "0.1.0",
-  STAGE: "stage1-engine",
-  GRID: { reels: 5, rows: 3 },
+  VERSION: "0.3.0",
+  STAGE: "stage3-gameplay",
+  GRID: { reels: 6, rows: 5 },
   START_BALANCE: 100,
   BETS: [1, 2, 5, 10, 20],
+  MIN_BET: 1,
+  PAY_DIV: 2, // cluster units -> credits divisor: payout = units * bet / PAY_DIV
+  FREE_SPINS: { 3: 8, 4: 12, 5: 20 },
+  SCATTER_PAY: { 3: 2, 4: 5, 5: 25 }, // x bet, added on trigger
+  MULT_LADDER: [1, 2, 3, 5, 10, 25, 50, 100], // base-game cascade step multipliers
+  FS_LADDER: [4, 6, 10, 16, 25, 40, 65, 100], // COSMIC ASCENSION cascade multipliers
+  FS_MULT_START: 4,
+  FS_MULT_CAP: 100,
+  ASCENSION_CHARGES: 12,
+  ASCENSION_MULT: 5,
+  ASCENSION_PER_SCATTER: 3,
+  MAX_CASCADE_STEPS: 12,
+  BIG_WIN_TIERS: [
+    { name: "COSMIC WIN", mult: 100 },
+    { name: "EPIC WIN", mult: 50 },
+    { name: "MEGA WIN", mult: 25 },
+    { name: "BIG WIN", mult: 10 },
+  ],
+  DEBUG_MODE: false,
+  DEBUG_SEED: null,
+  SUPABASE_URL: "",
+  SUPABASE_ANON_KEY: "",
+  SUPABASE_EDGE_FUNCTION: "",
+  SUPABASE_TABLE: "leaderboard",
+  STORAGE_PREFIX: "zodiacAscension.v1.",
+  LEADERBOARD_SIZE: 50,
   AUTO_COUNTS: [10, 25, 50, 100, 250, 500],
   RANK_TITLES: [
     { max: 1, title: "COSMIC LEGEND" },
@@ -35,32 +62,6 @@ const CONFIG = {
     { max: 25, title: "STAR WIELDER" },
     { max: 50, title: "ASTRAL SEEKER" },
   ],
-  MIN_BET: 1,
-  WAYS_DIV: 2.5, // units -> credits divisor for 243-ways paytable
-  FREE_SPINS: { 3: 8, 4: 12, 5: 20 },
-  SCATTER_PAY: { 3: 2, 4: 5, 5: 25 }, // x bet, added on trigger
-  MULT_LADDER: [1, 2, 3, 5, 8, 10], // base-mode cascade step multipliers
-  FS_MULT_START: 2, // free-spin persistent multiplier seed
-  FS_MULT_CAP: 20,
-  ASCENSION_CHARGES: 12,
-  ASCENSION_MULT: 5,
-  ASCENSION_PER_SCATTER: 3,
-  MAX_CASCADE_STEPS: 12,
-  BIG_WIN_TIERS: [
-    { name: "COSMIC WIN", mult: 50 },
-    { name: "MEGA WIN", mult: 25 },
-    { name: "BIG WIN", mult: 10 },
-  ],
-  DEBUG_MODE: false, // when true + DEBUG_SEED, RNG is reproducible
-  DEBUG_SEED: null,
-  // Supabase (frontend-safe values only — never a service-role key).
-  // Provide at runtime via window.ZODIAC_SUPABASE = { url, anonKey, edgeFunction? }
-  SUPABASE_URL: "",
-  SUPABASE_ANON_KEY: "",
-  SUPABASE_EDGE_FUNCTION: "", // optional: validated server-side writes
-  SUPABASE_TABLE: "leaderboard",
-  STORAGE_PREFIX: "zodiacAscension.v1.",
-  LEADERBOARD_SIZE: 50,
 };
 
 /* ========================================================================== *
@@ -69,14 +70,12 @@ const CONFIG = {
 const Utils = {
   clamp(v, a, b) { return v < a ? a : v > b ? b : v; },
   lerp(a, b, t) { return a + (b - a) * t; },
-  pick(arr, rnd) { return arr[Math.floor(rnd() * arr.length)]; },
   wait(ms) { return new Promise((r) => setTimeout(r, ms)); },
   tween(target, vars) {
     return new Promise((resolve) => {
       gsap.to(target, { ...vars, onComplete: () => resolve(target), overwrite: "auto" });
     });
   },
-  killTweens(target) { gsap.killTweensOf(target); },
   uuid() {
     if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
     return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
@@ -93,10 +92,11 @@ const Utils = {
     return `rgba(${r},${g},${b},${a})`;
   },
   fmt(n) { return Number.isInteger(n) ? String(n) : n.toFixed(1); },
+  credits(n) { return (Math.round(n * 100) / 100).toFixed(2); },
 };
 
 /* ========================================================================== *
- * MODULE: EventBus
+ * MODULE: EventBus + EVENTS
  * ========================================================================== */
 const EventBus = (() => {
   const listeners = new Map();
@@ -118,7 +118,6 @@ const EventBus = (() => {
   };
 })();
 
-/* Canonical game events (contract for later stages). */
 const EVENTS = {
   GAME_READY: "GAME_READY", SPIN_STARTED: "SPIN_STARTED", REEL_STOPPED: "REEL_STOPPED",
   SPIN_RESOLVED: "SPIN_RESOLVED", WIN_FOUND: "WIN_FOUND", CASCADE_STARTED: "CASCADE_STARTED",
@@ -132,17 +131,13 @@ const EVENTS = {
 };
 
 /* ========================================================================== *
- * MODULE: RNG
- * crypto-backed by default. In DEBUG_MODE with a DEBUG_SEED, a seeded
- * mulberry32 stream makes results reproducible. Game results NEVER use
- * Math.random().
+ * MODULE: RNG — crypto-backed. DEBUG_MODE + DEBUG_SEED => reproducible.
  * ========================================================================== */
 const RNG = (() => {
   let seeded = null;
   let activeSeed = null;
   let draws = 0;
   const buf = new Uint32Array(1);
-
   function mulberry32(seed) {
     let a = seed >>> 0;
     return function () {
@@ -158,20 +153,14 @@ const RNG = (() => {
   }
   return {
     configure({ debugMode = false, seed = null } = {}) {
-      if (debugMode && seed != null) {
-        activeSeed = seed >>> 0;
-        seeded = mulberry32(activeSeed);
-      } else {
-        seeded = null;
-        activeSeed = null;
-      }
+      if (debugMode && seed != null) { activeSeed = seed >>> 0; seeded = mulberry32(activeSeed); }
+      else { seeded = null; activeSeed = null; }
       draws = 0;
     },
     isSeeded() { return seeded != null; },
     float() { draws++; return seeded ? seeded() : cryptoFloat(); },
     int(n) { return Math.floor(this.float() * n); },
     pickWeighted(entries) {
-      // entries: [{ id, weight }]
       let total = 0;
       for (const e of entries) total += e.weight;
       let r = this.float() * total;
@@ -179,91 +168,115 @@ const RNG = (() => {
       return entries[entries.length - 1].id;
     },
     info() {
-      return {
-        source: seeded ? "seeded-mulberry32" : "crypto.getRandomValues",
-        seed: activeSeed,
-        draws,
-      };
+      return { source: seeded ? "seeded-mulberry32" : "crypto.getRandomValues", seed: activeSeed, draws };
     },
   };
 })();
 
 /* ========================================================================== *
- * MODULE: Symbols — procedural SVG glyph registry (no binary assets)
- * Glyph space: 24x24, stroke-based. Drawn on canvas AND reused as inline SVG.
+ * MODULE: Glyphs — procedural SVG glyph registry (canvas + DOM shared).
+ * Glyph space 24x24. Parts: {d, fill?} | {cx,cy,r} | {cx,cy,rx,ry,rot?}.
  * ========================================================================== */
 const Glyphs = {
-  aries: [
-    { d: "M12 21 V10" },
-    { d: "M12 10 C12 4.5 6.5 3 5.5 6.5 C4.8 9.2 7.5 10.8 9.6 9.4" },
-    { d: "M12 10 C12 4.5 17.5 3 18.5 6.5 C19.2 9.2 16.5 10.8 14.4 9.4" },
+  // ---- gems (LOW) ----
+  emerald: [
+    { d: "M6 3 H18 L21 6 V18 L18 21 H6 L3 18 V6 Z" },
+    { d: "M8.5 6.5 H15.5 L17.5 8.5 V15.5 L15.5 17.5 H8.5 L6.5 15.5 V8.5 Z" },
+    { d: "M8.5 6.5 L6.5 8.5 M15.5 6.5 L17.5 8.5 M8.5 17.5 L6.5 15.5 M15.5 17.5 L17.5 15.5" },
   ],
-  taurus: [
-    { cx: 12, cy: 14.6, r: 4.5 },
-    { d: "M5.5 4 C5.5 8 8.5 10.1 12 10.1 C15.5 10.1 18.5 8 18.5 4" },
+  ruby: [
+    { d: "M4 9 L8 4 H16 L20 9 Z" },
+    { d: "M4 9 H20 L12 20 Z" },
+    { d: "M8 4 L10 9 L12 20 M16 4 L14 9 L12 20 M10 9 H14" },
   ],
-  gemini: [
-    { d: "M5.5 4.5 C8.5 6.6 15.5 6.6 18.5 4.5" },
-    { d: "M5.5 19.5 C8.5 17.4 15.5 17.4 18.5 19.5" },
-    { d: "M9.2 6 V18" }, { d: "M14.8 6 V18" },
+  sapphire: [
+    { cx: 12, cy: 12, r: 8.5 },
+    { cx: 12, cy: 12, r: 4.4 },
+    { d: "M12 3.5 V7.6 M12 16.4 V20.5 M3.5 12 H7.6 M16.4 12 H20.5 M6 6 L8.9 8.9 M18 6 L15.1 8.9 M6 18 L8.9 15.1 M18 18 L15.1 15.1" },
   ],
-  cancer: [
-    { cx: 8, cy: 9.2, r: 2.6 }, { cx: 16, cy: 14.8, r: 2.6 },
-    { d: "M4.5 8.2 C8.5 4.2 15 4.8 19.2 9.5" },
-    { d: "M19.5 15.8 C15.5 19.8 9 19.2 4.8 14.5" },
+  amethyst: [
+    { d: "M12 2 L16.5 7 V16.5 L12 22 L7.5 16.5 V7 Z" },
+    { d: "M12 2 V22 M7.5 7 H16.5 M7.5 16.5 H16.5" },
   ],
-  leo: [
-    { cx: 7, cy: 15.6, r: 2.4 },
-    { d: "M9.4 15.6 C13.5 15.6 15.2 13.6 14.6 10.6 C14 7.8 10.4 7.4 9.6 9.9 C8.9 12.1 11.6 13.3 14.4 12.9 C17.2 12.5 18.6 14.6 18 16.8 C17.5 18.7 15.2 19 14.6 17.4" },
+  topaz: [
+    { d: "M12 2.5 C15 6 19.5 9 19.5 14 A7.5 7.5 0 0 1 4.5 14 C4.5 9 9 6 12 2.5 Z" },
+    { cx: 12, cy: 14, r: 4.4 },
+    { d: "M12 2.5 V9.6" },
   ],
-  virgo: [
-    { d: "M4 13 C4 9.5 6.8 9.5 6.8 12 V15.5" },
-    { d: "M6.8 12 C6.8 9.5 9.6 9.5 9.6 12 V15.5" },
-    { d: "M9.6 12 C9.6 9.5 12.4 9.5 12.4 12 V16.5" },
-    { d: "M12.4 13.5 C14.8 10.8 18.2 12.2 17 14.6 C16 16.6 12.6 16.3 12.4 16.3" },
-    { d: "M15.6 15.6 L19 19" },
+  diamond: [
+    { d: "M7 4 H17 L21 9 L12 21 L3 9 Z" },
+    { d: "M3 9 H21 M7 4 L10 9 L12 21 M17 4 L14 9 L12 21" },
+    { d: "M19.2 2.4 L19.8 3.9 L21.3 4.5 L19.8 5.1 L19.2 6.6 L18.6 5.1 L17.1 4.5 L18.6 3.9 Z", fill: true },
   ],
-  libra: [
-    { d: "M4.5 18.5 H19.5" },
-    { d: "M4.5 15.2 H7.6" }, { d: "M16.4 15.2 H19.5" },
-    { d: "M7.6 15.2 C7.6 10.8 9.6 8.6 12 8.6 C14.4 8.6 16.4 10.8 16.4 15.2" },
+  // ---- celestial artifacts (MEDIUM) ----
+  ring: [
+    { cx: 12, cy: 12, r: 5.6 },
+    { cx: 12, cy: 12, rx: 9.4, ry: 3.1, rot: -0.32 },
+    { d: "M19.6 4.6 L20.1 5.9 L21.4 6.4 L20.1 6.9 L19.6 8.2 L19.1 6.9 L17.8 6.4 L19.1 5.9 Z", fill: true },
   ],
-  scorpio: [
-    { d: "M4 13 C4 9.5 6.8 9.5 6.8 12 V15.5" },
-    { d: "M6.8 12 C6.8 9.5 9.6 9.5 9.6 12 V15.5" },
-    { d: "M9.6 12 C9.6 9.5 12.4 9.5 12.4 12 V16.5 C12.4 19 14.6 19.8 16.6 18.9 L18.6 17.8" },
-    { d: "M16.6 15.2 L18.8 17.6 L15.9 18.4" },
+  crown: [
+    { d: "M4 18 L4 9.5 L8.5 13 L12 6.5 L15.5 13 L20 9.5 L20 18 Z" },
+    { d: "M4 15.4 H20" },
+    { cx: 12, cy: 4.4, r: 1.1, fill: true },
+    { cx: 4.4, cy: 7.4, r: 0.8, fill: true },
+    { cx: 19.6, cy: 7.4, r: 0.8, fill: true },
   ],
-  sagittarius: [
-    { d: "M4.5 19.5 L19 5" },
-    { d: "M12.8 5 H19 V11.2" },
-    { d: "M7.8 11.8 L12.2 16.2" },
+  chalice: [
+    { d: "M5 3.5 H19 C19 9.6 16.4 12.8 12 12.8 C7.6 12.8 5 9.6 5 3.5 Z" },
+    { d: "M12 12.8 V18" },
+    { d: "M8 20.5 H16 M12 18 L8.5 20.5 M12 18 L15.5 20.5" },
+    { d: "M13.4 5.4 A2.6 2.6 0 1 0 13.4 9.6 A3.3 3.3 0 0 1 13.4 5.4 Z", fill: true },
   ],
-  capricorn: [
-    { d: "M4 9.5 C4 6.5 6.6 6.3 7.2 8.8 C7.9 11.6 7.6 14 9 15.6" },
-    { d: "M10.6 12.4 C11.4 10.6 13.6 10.2 14.9 11.4 C16.4 12.7 16 14.9 14.2 15.3 C12.6 15.7 11.6 14.2 12.5 13" },
-    { d: "M14.2 15.3 C17.8 14.6 19.8 16.8 18.2 18.9 C16.6 21 13.9 19.7 14.9 17.8 C15.5 16.6 17.2 16.7 17.4 17.9" },
+  orb: [
+    { cx: 12, cy: 12, r: 7.4 },
+    { cx: 12, cy: 12, rx: 10, ry: 3.2, rot: 0.35 },
+    { d: "M12 8 L13 11 L16 12 L13 13 L12 16 L11 13 L8 12 L11 11 Z", fill: true },
   ],
-  aquarius: [
-    { d: "M4.5 9.5 L8 6.2 L11.5 9.5 L15 6.2 L18.5 9.5" },
-    { d: "M4.5 16 L8 12.7 L11.5 16 L15 12.7 L18.5 16" },
+  // ---- cosmic powers (HIGH) ----
+  sun: [
+    { cx: 12, cy: 12, r: 4.6 },
+    { d: "M12 2.5 V5.5 M12 18.5 V21.5 M2.5 12 H5.5 M18.5 12 H21.5 M5.3 5.3 L7.4 7.4 M16.6 16.6 L18.7 18.7 M18.7 5.3 L16.6 7.4 M7.4 16.6 L5.3 18.7" },
   ],
-  pisces: [
-    { d: "M7.5 4 C10.8 8.5 10.8 15.5 7.5 20" },
-    { d: "M16.5 4 C13.2 8.5 13.2 15.5 16.5 20" },
-    { d: "M4 12 H20" },
+  moon: [
+    { d: "M15.5 3.8 A8.6 8.6 0 1 0 15.5 20.2 A10.2 10.2 0 0 1 15.5 3.8 Z", fill: true },
+    { d: "M17.6 5.8 L18.1 7.1 L19.4 7.6 L18.1 8.1 L17.6 9.4 L17.1 8.1 L15.8 7.6 L17.1 7.1 Z", fill: true },
+    { cx: 19.2, cy: 12.4, r: 0.8, fill: true },
   ],
-  wild: [
-    { cx: 12, cy: 12, r: 3.6 },
-    { d: "M12 3.4 V6.1" }, { d: "M12 17.9 V20.6" },
-    { d: "M3.4 12 H6.1" }, { d: "M17.9 12 H20.6" },
-    { d: "M5.9 5.9 L7.8 7.8" }, { d: "M16.2 16.2 L18.1 18.1" },
-    { d: "M18.1 5.9 L16.2 7.8" }, { d: "M7.8 16.2 L5.9 18.1" },
+  saturn: [
+    { cx: 12, cy: 12, r: 5.4 },
+    { cx: 12, cy: 12, rx: 9.6, ry: 3, rot: -0.3 },
+    { d: "M7.4 10.2 C9.4 9.2 14.6 9.2 16.6 10.2" },
   ],
+  blackhole: [
+    { cx: 12, cy: 12, r: 7.6 },
+    { cx: 12, cy: 12, r: 3.3, fill: true },
+    { d: "M4.2 14.4 A8.6 8.6 0 0 0 12 20.6" },
+    { d: "M19.8 9.6 A8.6 8.6 0 0 0 12 3.4" },
+    { cx: 4.4, cy: 5.8, r: 0.8, fill: true },
+    { cx: 19.8, cy: 17.6, r: 0.8, fill: true },
+  ],
+  // ---- special ----
   scatter: [
-    { d: "M14.8 4.2 A8.1 8.1 0 1 0 14.8 19.8 A9.8 9.8 0 0 1 14.8 4.2 Z", fill: true },
-    { d: "M18.4 3.6 L19 5.2 L20.6 5.8 L19 6.4 L18.4 8 L17.8 6.4 L16.2 5.8 L17.8 5.2 Z", fill: true },
+    { cx: 12, cy: 12, r: 9 },
+    { cx: 12, cy: 12, r: 5.8 },
+    { d: "M17.8 12 L21 12 M17 14.9 L19.8 16.5 M14.9 17 L16.5 19.8 M12 17.8 L12 21 M9.1 17 L7.5 19.8 M7 14.9 L4.2 16.5 M6.2 12 L3 12 M7 9.1 L4.2 7.5 M9.1 7 L7.5 4.2 M12 6.2 L12 3 M14.9 7 L16.5 4.2 M17 9.1 L19.8 7.5" },
+    { d: "M12 8.6 L12.9 11.1 L15.4 12 L12.9 12.9 L12 15.4 L11.1 12.9 L8.6 12 L11.1 11.1 Z", fill: true },
+    { cx: 19.4, cy: 9.6, r: 0.7, fill: true },
+    { cx: 5.6, cy: 16.4, r: 0.7, fill: true },
   ],
+  // ---- zodiac ring glyphs (menu decoration) ----
+  aries: [{ d: "M12 21 V10" }, { d: "M12 10 C12 4.5 6.5 3 5.5 6.5 C4.8 9.2 7.5 10.8 9.6 9.4" }, { d: "M12 10 C12 4.5 17.5 3 18.5 6.5 C19.2 9.2 16.5 10.8 14.4 9.4" }],
+  taurus: [{ cx: 12, cy: 14.6, r: 4.5 }, { d: "M5.5 4 C5.5 8 8.5 10.1 12 10.1 C15.5 10.1 18.5 8 18.5 4" }],
+  gemini: [{ d: "M5.5 4.5 C8.5 6.6 15.5 6.6 18.5 4.5" }, { d: "M5.5 19.5 C8.5 17.4 15.5 17.4 18.5 19.5" }, { d: "M9.2 6 V18" }, { d: "M14.8 6 V18" }],
+  cancer: [{ cx: 8, cy: 9.2, r: 2.6 }, { cx: 16, cy: 14.8, r: 2.6 }, { d: "M4.5 8.2 C8.5 4.2 15 4.8 19.2 9.5" }, { d: "M19.5 15.8 C15.5 19.8 9 19.2 4.8 14.5" }],
+  leo: [{ cx: 7, cy: 15.6, r: 2.4 }, { d: "M9.4 15.6 C13.5 15.6 15.2 13.6 14.6 10.6 C14 7.8 10.4 7.4 9.6 9.9 C8.9 12.1 11.6 13.3 14.4 12.9 C17.2 12.5 18.6 14.6 18 16.8 C17.5 18.7 15.2 19 14.6 17.4" }],
+  virgo: [{ d: "M4 13 C4 9.5 6.8 9.5 6.8 12 V15.5" }, { d: "M6.8 12 C6.8 9.5 9.6 9.5 9.6 12 V15.5" }, { d: "M9.6 12 C9.6 9.5 12.4 9.5 12.4 12 V16.5" }, { d: "M12.4 13.5 C14.8 10.8 18.2 12.2 17 14.6 C16 16.6 12.6 16.3 12.4 16.3" }, { d: "M15.6 15.6 L19 19" }],
+  libra: [{ d: "M4.5 18.5 H19.5" }, { d: "M4.5 15.2 H7.6" }, { d: "M16.4 15.2 H19.5" }, { d: "M7.6 15.2 C7.6 10.8 9.6 8.6 12 8.6 C14.4 8.6 16.4 10.8 16.4 15.2" }],
+  scorpio: [{ d: "M4 13 C4 9.5 6.8 9.5 6.8 12 V15.5" }, { d: "M6.8 12 C6.8 9.5 9.6 9.5 9.6 12 V15.5" }, { d: "M9.6 12 C9.6 9.5 12.4 9.5 12.4 12 V16.5 C12.4 19 14.6 19.8 16.6 18.9 L18.6 17.8" }, { d: "M16.6 15.2 L18.8 17.6 L15.9 18.4" }],
+  sagittarius: [{ d: "M4.5 19.5 L19 5" }, { d: "M12.8 5 H19 V11.2" }, { d: "M7.8 11.8 L12.2 16.2" }],
+  capricorn: [{ d: "M4 9.5 C4 6.5 6.6 6.3 7.2 8.8 C7.9 11.6 7.6 14 9 15.6" }, { d: "M10.6 12.4 C11.4 10.6 13.6 10.2 14.9 11.4 C16.4 12.7 16 14.9 14.2 15.3 C12.6 15.7 11.6 14.2 12.5 13" }, { d: "M14.2 15.3 C17.8 14.6 19.8 16.8 18.2 18.9 C16.6 21 13.9 19.7 14.9 17.8 C15.5 16.6 17.2 16.7 17.4 17.9" }],
+  aquarius: [{ d: "M4.5 9.5 L8 6.2 L11.5 9.5 L15 6.2 L18.5 9.5" }, { d: "M4.5 16 L8 12.7 L11.5 16 L15 12.7 L18.5 16" }],
+  pisces: [{ d: "M7.5 4 C10.8 8.5 10.8 15.5 7.5 20" }, { d: "M16.5 4 C13.2 8.5 13.2 15.5 16.5 20" }, { d: "M4 12 H20" }],
 };
 
 const TIER_COLORS = {
@@ -271,30 +284,37 @@ const TIER_COLORS = {
   wild: "#ffd98a", scatter: "#ff7ad9",
 };
 
+/* ========================================================================== *
+ * MODULE: MATH — symbol table (tunable).
+ * id · name · tier · weight · minMatch · pay(units per cluster size) · color
+ * payout credits = units * bet / CONFIG.PAY_DIV
+ * ========================================================================== */
 const SYMBOLS = [
-  // Low tier
-  { id: "aries", name: "Aries", tier: "low", element: "fire", weight: 10, pay: { 3: 0.4, 4: 1.5, 5: 5 } },
-  { id: "taurus", name: "Taurus", tier: "low", element: "earth", weight: 10, pay: { 3: 0.4, 4: 1.5, 5: 5 } },
-  { id: "gemini", name: "Gemini", tier: "low", element: "air", weight: 10, pay: { 3: 0.4, 4: 1.5, 5: 5 } },
-  { id: "cancer", name: "Cancer", tier: "low", element: "water", weight: 10, pay: { 3: 0.4, 4: 1.5, 5: 5 } },
-  { id: "libra", name: "Libra", tier: "low", element: "air", weight: 11, pay: { 3: 0.4, 4: 1.5, 5: 5 } },
-  // Mid tier
-  { id: "virgo", name: "Virgo", tier: "mid", element: "earth", weight: 7, pay: { 3: 0.6, 4: 2.2, 5: 8 } },
-  { id: "sagittarius", name: "Sagittarius", tier: "mid", element: "fire", weight: 7, pay: { 3: 0.6, 4: 2.2, 5: 8 } },
-  { id: "aquarius", name: "Aquarius", tier: "mid", element: "air", weight: 7, pay: { 3: 0.6, 4: 2.2, 5: 8 } },
-  { id: "pisces", name: "Pisces", tier: "mid", element: "water", weight: 7, pay: { 3: 0.6, 4: 2.2, 5: 8 } },
-  // High tier
-  { id: "leo", name: "Leo", tier: "high", element: "fire", weight: 5, pay: { 3: 1, 4: 4, 5: 15 } },
-  { id: "scorpio", name: "Scorpio", tier: "high", element: "water", weight: 5, pay: { 3: 1, 4: 4, 5: 15 } },
-  { id: "capricorn", name: "Capricorn", tier: "high", element: "earth", weight: 5, pay: { 3: 1, 4: 4, 5: 15 } },
-  // Specials
-  { id: "wild", name: "Solar Wild", tier: "special", element: "wild", weight: 2, pay: { 3: 2, 4: 8, 5: 40 } },
-  { id: "scatter", name: "Lunar Scatter", tier: "special", element: "scatter", weight: 3, pay: null },
+  // LOW — gems
+  { id: "emerald", name: "Emerald", tier: "low", weight: 11, minMatch: 5, pay: { 5: 1, 6: 1.5, 7: 2.5, 8: 4, 9: 6, 10: 9, 11: 13, 12: 18 }, color: "#3fe88f" },
+  { id: "ruby", name: "Ruby", tier: "low", weight: 10, minMatch: 5, pay: { 5: 1, 6: 1.6, 7: 2.7, 8: 4.2, 9: 6.4, 10: 10, 11: 14, 12: 20 }, color: "#ff5d7a" },
+  { id: "sapphire", name: "Sapphire", tier: "low", weight: 9, minMatch: 5, pay: { 5: 1.1, 6: 1.7, 7: 2.9, 8: 4.5, 9: 7, 10: 11, 11: 15, 12: 22 }, color: "#4aa8ff" },
+  { id: "amethyst", name: "Amethyst", tier: "low", weight: 8, minMatch: 5, pay: { 5: 1.2, 6: 1.8, 7: 3, 8: 4.8, 9: 7.5, 10: 12, 11: 16, 12: 24 }, color: "#b57aff" },
+  { id: "topaz", name: "Topaz", tier: "low", weight: 7.5, minMatch: 5, pay: { 5: 1.3, 6: 2, 7: 3.2, 8: 5, 9: 8, 10: 12.5, 11: 17, 12: 25 }, color: "#ffb84d" },
+  { id: "diamond", name: "Cosmic Diamond", tier: "low", weight: 7, minMatch: 5, pay: { 5: 1.5, 6: 2.2, 7: 3.5, 8: 5.5, 9: 9, 10: 14, 11: 19, 12: 28 }, color: "#bff3ff" },
+  // MEDIUM — celestial artifacts
+  { id: "ring", name: "Celestial Ring", tier: "mid", weight: 6.5, minMatch: 4, pay: { 4: 1.4, 5: 2.2, 6: 3.6, 7: 5.5, 8: 8, 9: 11, 10: 15, 11: 20, 12: 26 }, color: "#ffd98a" },
+  { id: "crown", name: "Zodiac Crown", tier: "mid", weight: 6, minMatch: 4, pay: { 4: 1.5, 5: 2.4, 6: 4, 7: 6, 8: 9, 9: 12, 10: 16, 11: 22, 12: 30 }, color: "#ffe9ad" },
+  { id: "chalice", name: "Lunar Chalice", tier: "mid", weight: 5.5, minMatch: 4, pay: { 4: 1.7, 5: 2.6, 6: 4.3, 7: 6.5, 8: 9.5, 9: 13, 10: 18, 11: 24, 12: 32 }, color: "#c9d6ff" },
+  { id: "orb", name: "Astral Orb", tier: "mid", weight: 5, minMatch: 4, pay: { 4: 1.8, 5: 2.8, 6: 4.6, 7: 7, 8: 10, 9: 14, 10: 19, 11: 26, 12: 35 }, color: "#7ee0d2" },
+  // HIGH — cosmic powers
+  { id: "sun", name: "Sun", tier: "high", weight: 4.5, minMatch: 4, pay: { 4: 2.2, 5: 3.4, 6: 5.5, 7: 8, 8: 12, 9: 16, 10: 22, 11: 30, 12: 40 }, color: "#ffd24d" },
+  { id: "moon", name: "Moon", tier: "high", weight: 4, minMatch: 4, pay: { 4: 2.5, 5: 3.8, 6: 6, 7: 9, 8: 13, 9: 18, 10: 25, 11: 34, 12: 45 }, color: "#e8ecff" },
+  { id: "saturn", name: "Saturn", tier: "high", weight: 3.5, minMatch: 4, pay: { 4: 3, 5: 4.5, 6: 7, 7: 10.5, 8: 15, 9: 21, 10: 29, 11: 40, 12: 55 }, color: "#f2a65e" },
+  { id: "blackhole", name: "Black Hole", tier: "high", weight: 3, minMatch: 4, pay: { 4: 4, 5: 6, 6: 9, 7: 14, 8: 20, 9: 28, 10: 38, 11: 52, 12: 70 }, color: "#9d6bff" },
+  // SPECIAL
+  { id: "scatter", name: "Zodiac Scatter", tier: "special", weight: 3.5, minMatch: null, pay: null, color: "#ff7ad9" },
 ];
 const SYMBOL_BY_ID = Object.fromEntries(SYMBOLS.map((s) => [s.id, s]));
-const PAYABLE = SYMBOLS.filter((s) => s.pay); // wild included, scatter excluded
+const PAYABLE = SYMBOLS.filter((s) => s.pay);
+for (const s of PAYABLE) s.payKeys = Object.keys(s.pay).map(Number).sort((a, b) => a - b);
 
-/* Simplified constellation maps (normalized 0..1) per zodiac symbol. */
+/* Constellation maps for ambient/win art (normalized 0..1). */
 const CONSTELLATIONS = {
   aries: { pts: [[0.15, 0.6], [0.38, 0.42], [0.62, 0.35], [0.88, 0.45]], lines: [[0, 1], [1, 2], [2, 3]] },
   taurus: { pts: [[0.1, 0.22], [0.35, 0.48], [0.55, 0.62], [0.8, 0.86], [0.76, 0.28], [0.5, 0.4]], lines: [[0, 1], [1, 2], [2, 3], [2, 5], [5, 4]] },
@@ -309,8 +329,8 @@ const CONSTELLATIONS = {
   aquarius: { pts: [[0.1, 0.34], [0.3, 0.24], [0.45, 0.4], [0.6, 0.28], [0.75, 0.44], [0.9, 0.34], [0.55, 0.72]], lines: [[0, 1], [1, 2], [2, 3], [3, 4], [4, 5], [2, 6]] },
   pisces: { pts: [[0.15, 0.24], [0.26, 0.5], [0.15, 0.76], [0.5, 0.5], [0.85, 0.24], [0.74, 0.5], [0.85, 0.76]], lines: [[0, 1], [1, 2], [1, 3], [3, 5], [4, 5], [5, 6]] },
 };
+const CONSTELLATION_IDS = Object.keys(CONSTELLATIONS);
 
-/* Glyph rendering shared by canvas + DOM SVG. */
 function drawGlyph(ctx, glyphId, x, y, size, color, glow = 0) {
   const parts = Glyphs[glyphId];
   if (!parts) return;
@@ -328,26 +348,30 @@ function drawGlyph(ctx, glyphId, x, y, size, color, glow = 0) {
     if (p.d) {
       const path = new Path2D(p.d);
       if (p.fill) ctx.fill(path); else ctx.stroke(path);
+    } else if (p.rx != null) {
+      ctx.beginPath();
+      ctx.ellipse(p.cx, p.cy, p.rx, p.ry, p.rot || 0, 0, Math.PI * 2);
+      ctx.stroke();
     } else {
       ctx.beginPath();
       ctx.arc(p.cx, p.cy, p.r, 0, Math.PI * 2);
-      ctx.stroke();
+      if (p.fill) ctx.fill(); else ctx.stroke();
     }
   }
   ctx.restore();
 }
 function glyphSVG(glyphId, sizePx, color) {
   const parts = Glyphs[glyphId] || [];
-  const inner = parts.map((p) =>
-    p.d
-      ? `<path d="${p.d}" ${p.fill ? `fill="${color}" stroke="none"` : `fill="none" stroke="${color}" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"`}/>`
-      : `<circle cx="${p.cx}" cy="${p.cy}" r="${p.r}" fill="none" stroke="${color}" stroke-width="1.9"/>`
-  ).join("");
+  const inner = parts.map((p) => {
+    if (p.d) return `<path d="${p.d}" ${p.fill ? `fill="${color}" stroke="none"` : `fill="none" stroke="${color}" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"`}/>`;
+    if (p.rx != null) return `<ellipse cx="${p.cx}" cy="${p.cy}" rx="${p.rx}" ry="${p.ry}" fill="none" stroke="${color}" stroke-width="1.9" ${p.rot ? `transform="rotate(${(p.rot * 180) / Math.PI} ${p.cx} ${p.cy})"` : ""}/>`;
+    return `<circle cx="${p.cx}" cy="${p.cy}" r="${p.r}" ${p.fill ? `fill="${color}"` : `fill="none" stroke="${color}" stroke-width="1.9"`}/>`;
+  }).join("");
   return `<svg viewBox="0 0 24 24" width="${sizePx}" height="${sizePx}">${inner}</svg>`;
 }
 
 /* ========================================================================== *
- * MODULE: StorageService
+ * MODULE: StorageService + SettingsManager
  * ========================================================================== */
 const StorageService = (() => {
   const P = CONFIG.STORAGE_PREFIX;
@@ -362,12 +386,9 @@ const StorageService = (() => {
     catch { return false; }
   }
   function remove(key) { try { localStorage.removeItem(P + key); } catch { /* noop */ } }
-  return { read, write, remove, readRaw: read, writeRaw: write };
+  return { read, write, remove };
 })();
 
-/* ========================================================================== *
- * MODULE: SettingsManager
- * ========================================================================== */
 const SettingsManager = (() => {
   const DEFAULTS = {
     masterVol: 0.8, sfxVol: 0.9, musicVol: 0.5, muted: false,
@@ -430,7 +451,7 @@ const GameState = (() => {
 })();
 
 /* ========================================================================== *
- * MODULE: GameStateMachine — strict transition table, no invalid jumps.
+ * MODULE: GameStateMachine — strict transition table.
  * ========================================================================== */
 const FSM = (() => {
   const TRANSITIONS = {
@@ -454,7 +475,7 @@ const FSM = (() => {
     get state() { return state; },
     can(next) { return (TRANSITIONS[state] || []).includes(next); },
     set(next, reason = "") {
-      if (state === next) return true; // no-op (guards double-execution, e.g. SPINNING->SPINNING)
+      if (state === next) return true;
       if (!this.can(next)) {
         console.warn(`[FSM] invalid transition ${state} -> ${next} (${reason})`);
         EventBus.emit(EVENTS.ERROR, { type: "FSM_INVALID_TRANSITION", from: state, to: next });
@@ -472,12 +493,10 @@ const FSM = (() => {
 })();
 
 /* ========================================================================== *
- * MODULE: SlotMath + WinEvaluator + CascadeEngine
- * Pure, deterministic once the RNG stream is fixed. The ENTIRE cascade chain
- * is precomputed before any animation runs.
+ * MODULE: SlotMath — cluster pays on 6x5. Pure & deterministic per RNG stream.
  * ========================================================================== */
 const SlotMath = (() => {
-  let debugForce = null; // dev-only: { type:'scatter'|'symbol', symbol?, count? }
+  let debugForce = null;
 
   function generateGrid() {
     const { reels, rows } = CONFIG.GRID;
@@ -492,76 +511,92 @@ const SlotMath = (() => {
       if (f.type === "scatter") {
         const n = Utils.clamp(f.count || 3, 3, 5);
         const cells = [];
-        for (let c = 0; c < 5; c++) for (let r = 0; r < 3; r++) cells.push([c, r]);
+        for (let c = 0; c < reels; c++) for (let r = 0; r < rows; r++) cells.push([c, r]);
         for (let i = cells.length - 1; i > 0; i--) { const j = RNG.int(i + 1); [cells[i], cells[j]] = [cells[j], cells[i]]; }
         for (let i = 0; i < n; i++) grid[cells[i][0]][cells[i][1]] = "scatter";
       } else if (f.type === "symbol") {
-        for (let c = 0; c < 3; c++) grid[c][RNG.int(3)] = f.symbol || "leo";
+        // force a guaranteed cluster: full vertical run on column 0
+        const sym = f.symbol || "blackhole";
+        for (let r = 0; r < rows; r++) grid[0][r] = sym;
       }
     }
     return grid;
   }
 
-  /* 243-ways evaluation: matching symbols (wild substitutes) on adjacent
-     reels from the left, any row. Wild-only combos pay separately. */
-  function evaluateGrid(grid, bet) {
-    const wins = [];
-    const winCells = new Map(); // key "c,r" -> true
-    let totalUnits = 0;
+  function clusterPay(sym, size) {
+    let k = sym.payKeys[0];
+    for (const key of sym.payKeys) { if (size >= key) k = key; else break; }
+    return sym.pay[k];
+  }
 
-    const countFor = (matchFn) => {
-      const perReel = [];
-      for (let c = 0; c < grid.length; c++) {
-        const cells = [];
-        for (let r = 0; r < grid[c].length; r++) if (matchFn(grid[c][r])) cells.push([c, r]);
-        if (cells.length === 0) break;
-        perReel.push(cells);
-      }
-      return perReel;
-    };
+  /* Cluster evaluation: orthogonally-connected groups of the same symbol.
+     A group pays when size >= symbol.minMatch. */
+  function evaluateGrid(grid, bet) {
+    const cols = grid.length, rows = grid[0].length;
+    const wins = [];
+    const winCellSet = new Set();
+    let totalUnits = 0;
+    let totalBase = 0;
 
     for (const sym of PAYABLE) {
-      const isWildRun = sym.id === "wild";
-      const perReel = countFor(isWildRun ? (s) => s === "wild" : (s) => s === sym.id || s === "wild");
-      const n = perReel.length;
-      if (n >= 3 && sym.pay[n]) {
-        let ways = 1;
-        for (const cells of perReel) ways *= cells.length;
-        const units = sym.pay[n] * ways;
-        totalUnits += units;
-        for (const cells of perReel) for (const [c, r] of cells) winCells.set(`${c},${r}`, true);
-        wins.push({ symbol: sym.id, reels: n, ways, units });
+      const seen = new Set();
+      for (let c = 0; c < cols; c++) {
+        for (let r = 0; r < rows; r++) {
+          if (grid[c][r] !== sym.id) continue;
+          const startKey = c * rows + r;
+          if (seen.has(startKey)) continue;
+          const cluster = [];
+          const stack = [[c, r]];
+          seen.add(startKey);
+          while (stack.length) {
+            const [cc, rr] = stack.pop();
+            cluster.push([cc, rr]);
+            const nb = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+            for (const [dc, dr] of nb) {
+              const nc = cc + dc, nr = rr + dr;
+              if (nc < 0 || nc >= cols || nr < 0 || nr >= rows) continue;
+              if (grid[nc][nr] !== sym.id) continue;
+              const k = nc * rows + nr;
+              if (!seen.has(k)) { seen.add(k); stack.push([nc, nr]); }
+            }
+          }
+          if (cluster.length >= sym.minMatch) {
+            const units = clusterPay(sym, cluster.length);
+            const credits = Math.max(1, Math.round((units * bet) / CONFIG.PAY_DIV));
+            totalUnits += units;
+            totalBase += credits;
+            for (const [cc, rr] of cluster) winCellSet.add(`${cc},${rr}`);
+            wins.push({ symbol: sym.id, size: cluster.length, units, credits, cells: cluster });
+          }
+        }
       }
     }
 
     let scatterCount = 0;
     const scatterCells = [];
-    for (let c = 0; c < grid.length; c++)
-      for (let r = 0; r < grid[c].length; r++)
+    for (let c = 0; c < cols; c++)
+      for (let r = 0; r < rows; r++)
         if (grid[c][r] === "scatter") { scatterCount++; scatterCells.push([c, r]); }
 
-    const totalBase = totalUnits > 0 ? Math.max(1, Math.round((totalUnits * bet) / CONFIG.WAYS_DIV)) : 0;
-    return { wins, totalUnits, totalBase, winCells: [...winCells.keys()], scatterCount, scatterCells };
+    return { wins, totalUnits, totalBase, winCells: [...winCellSet], scatterCount, scatterCells };
   }
 
   function collapseGrid(grid, winCellKeys) {
     const remove = new Set(winCellKeys);
     const { rows } = CONFIG.GRID;
     const newGrid = [];
-    const moves = []; // {col, symbol, fromRow|null, toRow, fall}
+    const moves = [];
     for (let c = 0; c < grid.length; c++) {
       const kept = [];
       for (let r = rows - 1; r >= 0; r--) if (!remove.has(`${c},${r}`)) kept.push({ sym: grid[c][r], fromRow: r });
-      kept.reverse(); // top..bottom order of survivors
+      kept.reverse();
       const col = new Array(rows).fill(null);
       const missing = rows - kept.length;
-      // survivors fall to the bottom
       kept.forEach((k, i) => {
         const toRow = missing + i;
         col[toRow] = k.sym;
         moves.push({ col: c, symbol: k.sym, fromRow: k.fromRow, toRow, fall: toRow - k.fromRow, spawned: false });
       });
-      // new symbols spawn from above
       for (let i = 0; i < missing; i++) {
         const sym = RNG.pickWeighted(SYMBOLS);
         col[i] = sym;
@@ -572,16 +607,15 @@ const SlotMath = (() => {
     return { grid: newGrid, moves };
   }
 
-  /* Precomputes the full outcome of one spin: every cascade step, its
-     multiplier and amount — before any animation. */
+  /* Full outcome precomputed before any animation. */
   function generateOutcome(bet, ctx = {}) {
     const source = RNG.info();
     const steps = [];
     let grid = generateGrid();
     let scatter = null;
-    let fsMult = ctx.freeSpin ? (ctx.fsMult || CONFIG.FS_MULT_START) : 1;
     const ascensionUsed = !!ctx.ascensionArmed;
     const globalMult = ascensionUsed ? CONFIG.ASCENSION_MULT : 1;
+    let maxMult = 1;
 
     for (let i = 0; i < CONFIG.MAX_CASCADE_STEPS; i++) {
       const ev = evaluateGrid(grid, bet);
@@ -595,11 +629,13 @@ const SlotMath = (() => {
         };
       }
       const hasWin = ev.totalBase > 0;
-      const stepMult = ctx.freeSpin ? fsMult : CONFIG.MULT_LADDER[Math.min(i, CONFIG.MULT_LADDER.length - 1)];
+      const ladder = ctx.freeSpin ? CONFIG.FS_LADDER : CONFIG.MULT_LADDER;
+      const stepMult = ladder[Math.min(i, ladder.length - 1)];
       const mult = stepMult * globalMult;
+      if (hasWin) maxMult = Math.max(maxMult, mult);
       const step = {
         grid, eval: ev, mult,
-        amount: hasWin ? ev.totalBase * mult : 0,
+        amount: hasWin ? Math.round(ev.totalBase * mult) : 0,
         collapse: null,
       };
       steps.push(step);
@@ -608,37 +644,33 @@ const SlotMath = (() => {
       const collapsed = collapseGrid(grid, ev.winCells);
       step.collapse = collapsed;
       grid = collapsed.grid;
-      if (ctx.freeSpin) fsMult = Math.min(CONFIG.FS_MULT_CAP, fsMult + 1);
     }
 
     const cascadeWins = steps.reduce((a, s) => a + (s.amount > 0 ? 1 : 0), 0);
     const totalWin = steps.reduce((a, s) => a + s.amount, 0) + (scatter ? scatter.pay : 0);
-    return { steps, scatter, totalWin, ascensionUsed, fsMultEnd: fsMult, cascadeWins, source, bet };
+    return { steps, scatter, totalWin, ascensionUsed, fsMultEnd: maxMult, cascadeWins, source, bet };
   }
 
   return {
-    generateGrid, evaluateGrid, collapseGrid, generateOutcome,
+    generateGrid, evaluateGrid, collapseGrid, generateOutcome, clusterPay,
     setDebugForce(f) { debugForce = f; },
   };
 })();
 
-/* Thin aliases for architectural clarity (delegating to SlotMath). */
 const WinEvaluator = { evaluate: (grid, bet) => SlotMath.evaluateGrid(grid, bet) };
 const CascadeEngine = { collapse: (grid, keys) => SlotMath.collapseGrid(grid, keys) };
 
-/* ========================================================================== *
- * MODULE: MultiplierEngine
- * ========================================================================== */
 const MultiplierEngine = {
   baseLadder: CONFIG.MULT_LADDER,
+  fsLadder: CONFIG.FS_LADDER,
   forStep(index, ctx = {}) {
-    if (ctx.freeSpin) return ctx.fsMult || CONFIG.FS_MULT_START;
-    return this.baseLadder[Math.min(index, this.baseLadder.length - 1)];
+    const ladder = ctx.freeSpin ? this.fsLadder : this.baseLadder;
+    return ladder[Math.min(index, ladder.length - 1)];
   },
 };
 
 /* ========================================================================== *
- * MODULE: BonusEngine (free spins)
+ * MODULE: BonusEngine — COSMIC ASCENSION (free spins).
  * ========================================================================== */
 const BonusEngine = (() => {
   const state = { active: false, remaining: 0, total: 0, mult: CONFIG.FS_MULT_START, totalWon: 0 };
@@ -656,7 +688,7 @@ const BonusEngine = (() => {
       SoundManager.play("bonus");
       await UIManager.showBonusGrant(scatter);
       while (state.remaining > 0) {
-        if (!state.active) break; // external stop (exit)
+        if (!state.active) break;
         state.remaining--;
         UIManager.updateStatus();
         const res = await SpinEngine.spin({ free: true });
@@ -679,24 +711,18 @@ const BonusEngine = (() => {
 })();
 
 /* ========================================================================== *
- * MODULE: ReelEngine — per-column view model consumed by the Renderer.
+ * MODULE: ReelEngine — per-column view model.
  * ========================================================================== */
 const ReelEngine = (() => {
   const { reels, rows } = CONFIG.GRID;
   const view = [];
   for (let c = 0; c < reels; c++) {
-    view.push({
-      mode: "idle", // idle | spin
-      spinSpeed: 0, // cells per second
-      spinOffset: 0,
-      spinSymbols: [],
-      cells: [], // {sym, row, off, scale, alpha, glow}
-    });
+    view.push({ mode: "idle", spinSpeed: 0, spinOffset: 0, spinSymbols: [], cells: [] });
   }
   function initStrips() {
     for (const col of view) {
       col.spinSymbols = [];
-      for (let i = 0; i < 24; i++) col.spinSymbols.push(RNG.pickWeighted(SYMBOLS));
+      for (let i = 0; i < 30; i++) col.spinSymbols.push(RNG.pickWeighted(SYMBOLS));
     }
   }
   function setGrid(grid) {
@@ -709,31 +735,28 @@ const ReelEngine = (() => {
   function cellAt(c, r) { return view[c].cells[r]; }
   function integrate(dt) {
     for (const col of view) {
-      if (col.mode === "spin") col.spinOffset = (col.spinOffset + col.spinSpeed * dt) % 24;
+      if (col.mode === "spin") col.spinOffset = (col.spinOffset + col.spinSpeed * dt) % 30;
     }
   }
   return { view, initStrips, setGrid, cellAt, integrate, rows, reels };
 })();
 
 /* ========================================================================== *
- * MODULE: ParticleEngine — pooled particles.
+ * MODULE: ParticleEngine — pooled.
  * ========================================================================== */
 const ParticleEngine = (() => {
   const pool = [];
   let cap = 320;
-  function spawn(p) {
-    if (pool.length >= cap) pool.shift();
-    pool.push(p);
-  }
   return {
     get list() { return pool; },
     setCap(n) { cap = n; while (pool.length > cap) pool.shift(); },
     clear() { pool.length = 0; },
     burst(x, y, color, n = 14, opts = {}) {
       for (let i = 0; i < n; i++) {
+        if (pool.length >= cap) pool.shift();
         const a = RNG.float() * Math.PI * 2;
         const sp = (opts.speed || 120) * (0.35 + RNG.float());
-        spawn({
+        pool.push({
           type: opts.type || "spark", x, y,
           vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - (opts.lift || 40),
           life: 0, maxLife: (opts.life || 0.7) * (0.6 + RNG.float() * 0.8),
@@ -743,16 +766,13 @@ const ParticleEngine = (() => {
         });
       }
     },
-    shards(x, y, color, n = 10) {
-      this.burst(x, y, color, n, { type: "shard", speed: 170, life: 0.8, size: 4, grav: 420 });
-    },
-    stardust(x, y, color, n = 8) {
-      this.burst(x, y, color, n, { type: "dust", speed: 40, life: 1.4, size: 2.2, grav: -18 });
-    },
+    shards(x, y, color, n = 10) { this.burst(x, y, color, n, { type: "shard", speed: 170, life: 0.8, size: 4, grav: 420 }); },
+    stardust(x, y, color, n = 8) { this.burst(x, y, color, n, { type: "dust", speed: 40, life: 1.4, size: 2.2, grav: -18 }); },
     coinFlight(x0, y0, x1, y1, color, n = 8) {
       for (let i = 0; i < n; i++) {
+        if (pool.length >= cap) pool.shift();
         const t = i / n;
-        spawn({
+        pool.push({
           type: "coin", x: x0 + (RNG.float() - 0.5) * 26, y: y0 + (RNG.float() - 0.5) * 18,
           tx: x1, ty: y1, life: -t * 0.28, maxLife: 0.62, size: 3.4, color,
           vx: 0, vy: 0, grav: 0, rot: 0, vr: 0,
@@ -781,7 +801,7 @@ const ParticleEngine = (() => {
     draw(ctx) {
       ctx.save();
       ctx.globalCompositeOperation = "lighter";
-      for (const p of this.list) {
+      for (const p of pool) {
         if (p.life < 0) continue;
         const t = p.life / p.maxLife;
         const a = t < 0.15 ? t / 0.15 : 1 - (t - 0.15) / 0.85;
@@ -795,13 +815,9 @@ const ParticleEngine = (() => {
           ctx.restore();
         } else if (p.type === "coin") {
           ctx.fillStyle = p.color;
-          ctx.beginPath();
-          ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
-          ctx.fill();
+          ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2); ctx.fill();
           ctx.fillStyle = "rgba(255,255,255,0.85)";
-          ctx.beginPath();
-          ctx.arc(p.x - p.size * 0.25, p.y - p.size * 0.25, p.size * 0.35, 0, Math.PI * 2);
-          ctx.fill();
+          ctx.beginPath(); ctx.arc(p.x - p.size * 0.25, p.y - p.size * 0.25, p.size * 0.35, 0, Math.PI * 2); ctx.fill();
         } else {
           ctx.fillStyle = p.color;
           ctx.beginPath();
@@ -821,9 +837,7 @@ const AmbientFX = (() => {
   const layers = [[], [], []];
   const meteors = [];
   let nebula = null;
-  let W = 0, H = 0;
-  let meteorTimer = 3;
-  let t = 0;
+  let W = 0, H = 0, meteorTimer = 3, t = 0;
   const pointer = { x: 0.5, y: 0.5 };
   const QUALITY = { starScale: 1, meteors: true, nebula: true };
 
@@ -858,7 +872,7 @@ const AmbientFX = (() => {
     for (const b of blobs) {
       const g = c.createRadialGradient(b.x * nebula.width, b.y * nebula.height, 0, b.x * nebula.width, b.y * nebula.height, b.r * nebula.width);
       g.addColorStop(0, b.color);
-      g.addColorStop(1, "rgba(4,6,26,0)");
+      g.addColorStop(1, "rgba(3,4,20,0)");
       c.fillStyle = g;
       c.fillRect(0, 0, nebula.width, nebula.height);
     }
@@ -873,30 +887,25 @@ const AmbientFX = (() => {
         meteorTimer = 4 + RNG.float() * 7;
         const fromLeft = RNG.float() < 0.5;
         meteors.push({
-          x: fromLeft ? -40 : W * (0.4 + RNG.float() * 0.7),
-          y: -30,
+          x: fromLeft ? -40 : W * (0.4 + RNG.float() * 0.7), y: -30,
           vx: (fromLeft ? 1 : -1) * (260 + RNG.float() * 220),
-          vy: 300 + RNG.float() * 200,
-          life: 0, maxLife: 1.15,
+          vy: 300 + RNG.float() * 200, life: 0, maxLife: 1.15,
         });
       }
     }
     for (let i = meteors.length - 1; i >= 0; i--) {
       const m = meteors[i];
-      m.life += dt;
-      m.x += m.vx * dt; m.y += m.vy * dt;
+      m.life += dt; m.x += m.vx * dt; m.y += m.vy * dt;
       if (m.life > m.maxLife || m.y > H + 60) meteors.splice(i, 1);
     }
   }
   function draw(ctx) {
-    // nebula
     if (nebula && QUALITY.nebula) {
       ctx.save();
       ctx.globalAlpha = 0.9;
       ctx.drawImage(nebula, 0, 0, W, H);
       ctx.restore();
     }
-    // stars (3 parallax layers + twinkle)
     const px = (pointer.x - 0.5), py = (pointer.y - 0.5);
     const depths = [5, 11, 20];
     for (let l = 0; l < 3; l++) {
@@ -907,18 +916,12 @@ const AmbientFX = (() => {
         const tw = 0.55 + 0.45 * Math.sin(t * s.tw + s.ph);
         ctx.globalAlpha = (0.28 + l * 0.2) * tw;
         ctx.fillStyle = s.hue;
-        ctx.beginPath();
-        ctx.arc(x, y, s.r, 0, Math.PI * 2);
-        ctx.fill();
+        ctx.beginPath(); ctx.arc(x, y, s.r, 0, Math.PI * 2); ctx.fill();
       }
     }
     ctx.globalAlpha = 1;
-
-    // planets
-    drawPlanet(ctx, W * 0.12, H * 0.78 + Math.sin(t * 0.4) * 5, Math.min(W, H) * 0.11);
-    drawMoon(ctx, W * 0.88, H * 0.16 + Math.sin(t * 0.3 + 2) * 4, Math.min(W, H) * 0.035);
-
-    // meteors
+    drawPlanet(ctx, W * 0.1, H * 0.8 + Math.sin(t * 0.4) * 5, Math.min(W, H) * 0.1);
+    drawMoon(ctx, W * 0.9, H * 0.14 + Math.sin(t * 0.3 + 2) * 4, Math.min(W, H) * 0.032);
     for (const m of meteors) {
       const a = 1 - m.life / m.maxLife;
       const len = 90;
@@ -926,34 +929,27 @@ const AmbientFX = (() => {
       const ny = m.y - (m.vy / Math.hypot(m.vx, m.vy)) * len;
       const g = ctx.createLinearGradient(m.x, m.y, nx, ny);
       g.addColorStop(0, `rgba(255,240,200,${0.85 * a})`);
-      g.addColorStop(0.35, `rgba(111,227,255,${0.4 * a})`);
-      g.addColorStop(1, "rgba(111,227,255,0)");
+      g.addColorStop(0.35, `rgba(53,224,255,${0.4 * a})`);
+      g.addColorStop(1, "rgba(53,224,255,0)");
       ctx.strokeStyle = g;
       ctx.lineWidth = 2.2;
-      ctx.beginPath();
-      ctx.moveTo(m.x, m.y);
-      ctx.lineTo(nx, ny);
-      ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(m.x, m.y); ctx.lineTo(nx, ny); ctx.stroke();
     }
   }
   function drawPlanet(ctx, x, y, r) {
     ctx.save();
     const g = ctx.createRadialGradient(x - r * 0.4, y - r * 0.4, r * 0.1, x, y, r);
-    g.addColorStop(0, "#3d5aa8");
-    g.addColorStop(0.55, "#1c2c66");
-    g.addColorStop(1, "#0a102f");
+    g.addColorStop(0, "#3d5aa8"); g.addColorStop(0.55, "#1c2c66"); g.addColorStop(1, "#0a102f");
     ctx.fillStyle = g;
     ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
-    // bands
-    ctx.strokeStyle = "rgba(111,227,255,0.14)";
+    ctx.strokeStyle = "rgba(53,224,255,0.13)";
     ctx.lineWidth = r * 0.09;
     for (let i = -2; i <= 2; i++) {
       ctx.beginPath();
       ctx.ellipse(x, y + i * r * 0.28, r * Math.sqrt(Math.max(0.05, 1 - (i * 0.28) ** 2)), r * 0.16, -0.18, 0.3, Math.PI - 0.3);
       ctx.stroke();
     }
-    // ring
-    ctx.strokeStyle = "rgba(242,200,109,0.32)";
+    ctx.strokeStyle = "rgba(245,201,107,0.3)";
     ctx.lineWidth = r * 0.07;
     ctx.beginPath();
     ctx.ellipse(x, y, r * 1.65, r * 0.42, -0.35, 0, Math.PI * 2);
@@ -963,9 +959,7 @@ const AmbientFX = (() => {
   function drawMoon(ctx, x, y, r) {
     ctx.save();
     const g = ctx.createRadialGradient(x - r * 0.35, y - r * 0.35, r * 0.1, x, y, r);
-    g.addColorStop(0, "#f4e7c8");
-    g.addColorStop(0.7, "#b9a878");
-    g.addColorStop(1, "#5c5138");
+    g.addColorStop(0, "#f4e7c8"); g.addColorStop(0.7, "#b9a878"); g.addColorStop(1, "#5c5138");
     ctx.fillStyle = g;
     ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
     ctx.fillStyle = "rgba(60,50,30,0.35)";
@@ -977,20 +971,18 @@ const AmbientFX = (() => {
 })();
 
 /* ========================================================================== *
- * MODULE: ConstellationEngine — ambient + win-triggered constellation art.
+ * MODULE: ConstellationEngine
  * ========================================================================== */
 const ConstellationEngine = (() => {
-  const flashes = []; // {id, alpha, x, y, size}
+  const flashes = [];
   const ambient = [];
   let W = 0, H = 0;
   function build(w, h) {
     W = w; H = h;
     ambient.length = 0;
-    const keys = Object.keys(CONSTELLATIONS);
-    const n = 3;
-    for (let i = 0; i < n; i++) {
+    for (let i = 0; i < 3; i++) {
       ambient.push({
-        id: keys[(i * 4 + 1) % keys.length],
+        id: CONSTELLATION_IDS[(i * 4 + 1) % CONSTELLATION_IDS.length],
         x: w * (0.12 + 0.33 * i) + (RNG.float() - 0.5) * 60,
         y: h * (0.16 + (i % 2) * 0.5) + (RNG.float() - 0.5) * 40,
         size: Math.min(w, h) * (0.16 + RNG.float() * 0.08),
@@ -1000,8 +992,8 @@ const ConstellationEngine = (() => {
   }
   function flash(id, x, y, size) {
     if (!CONSTELLATIONS[id]) return;
-    flashes.push({ id, x, y, size, alpha: 0, phase: 0 });
-    const f = flashes[flashes.length - 1];
+    const f = { id, x, y, size, alpha: 0, phase: 0 };
+    flashes.push(f);
     Utils.tween(f, { alpha: 1, duration: 0.25, ease: "power2.out" }).then(() =>
       Utils.tween(f, { alpha: 0, duration: 1.4, delay: 0.9, ease: "power1.inOut" })
     );
@@ -1045,7 +1037,7 @@ const ConstellationEngine = (() => {
 })();
 
 /* ========================================================================== *
- * MODULE: Renderer — canvas compositing of all layers.
+ * MODULE: Renderer — canvas compositing.
  * ========================================================================== */
 const Renderer = (() => {
   let canvas, ctx;
@@ -1054,10 +1046,7 @@ const Renderer = (() => {
   let shake = 0;
   const qual = { glow: true, blur: true };
 
-  function init(c) {
-    canvas = c;
-    ctx = c.getContext("2d");
-  }
+  function init(c) { canvas = c; ctx = c.getContext("2d"); }
   function resize() {
     const rect = canvas.parentElement.getBoundingClientRect();
     W = Math.max(320, rect.width);
@@ -1072,25 +1061,26 @@ const Renderer = (() => {
     ConstellationEngine.build(W, H);
   }
   function computeLayout() {
+    const { reels, rows } = CONFIG.GRID;
     const narrow = W < 760;
     const topPad = narrow ? 58 : 70;
-    const bottomPad = narrow ? 170 : 158;
+    const bottomPad = narrow ? 190 : 168;
     const availH = H - topPad - bottomPad;
     const railPad = W >= 900 && !narrow ? 46 : 8;
-    let cell = Math.min(availH / 3.35, (W - railPad * 2 - 24) / 5.5);
-    cell = Utils.clamp(cell, 46, 168);
+    let cell = Math.min(availH / (rows + 0.5), (W - railPad * 2 - 24) / (reels + 0.7));
+    cell = Utils.clamp(cell, 34, 132);
     layout.cell = cell;
-    layout.gridW = cell * 5;
-    layout.gridH = cell * 3;
+    layout.gridW = cell * reels;
+    layout.gridH = cell * rows;
     layout.ox = (W - layout.gridW) / 2 - (W >= 900 ? 14 : 0);
-    layout.oy = topPad + Math.max(0, (availH - layout.gridH * 1.12) / 2);
-    layout.frameX = layout.ox - cell * 0.22;
-    layout.frameY = layout.oy - cell * 0.22;
-    layout.frameW = layout.gridW + cell * 0.44;
-    layout.frameH = layout.gridH * 1.12 + cell * 0.44;
+    layout.oy = topPad + Math.max(0, (availH - layout.gridH * 1.08) / 2);
+    layout.frameX = layout.ox - cell * 0.18;
+    layout.frameY = layout.oy - cell * 0.18;
+    layout.frameW = layout.gridW + cell * 0.36;
+    layout.frameH = layout.gridH + cell * 0.36;
   }
   function cellCenter(c, r) {
-    return { x: layout.ox + c * layout.cell + layout.cell / 2, y: layout.oy + layout.cell * 0.06 + r * layout.cell + layout.cell / 2 };
+    return { x: layout.ox + c * layout.cell + layout.cell / 2, y: layout.oy + r * layout.cell + layout.cell / 2 };
   }
   function addShake(v) { shake = Math.min(10, shake + v); }
   function frameGeometry() { return { ...layout }; }
@@ -1104,17 +1094,16 @@ const Renderer = (() => {
     ctx.arcTo(x, y, x + w, y, r);
     ctx.closePath();
   }
-
   function drawChip(x, y, size, sym) {
     const def = SYMBOL_BY_ID[sym];
-    const base = TIER_COLORS[def.element];
-    const pad = size * 0.07;
+    const base = (def && def.color) || "#9fd8ff";
+    const pad = size * 0.06;
     const s = size - pad * 2;
     roundRect(x + pad, y + pad, s, s, s * 0.18);
     const g = ctx.createRadialGradient(x + size / 2, y + size * 0.36, s * 0.1, x + size / 2, y + size / 2, s * 0.75);
-    g.addColorStop(0, Utils.rgba(base, 0.30));
-    g.addColorStop(0.6, "rgba(13,19,52,0.92)");
-    g.addColorStop(1, "rgba(7,10,32,0.96)");
+    g.addColorStop(0, Utils.rgba(base, 0.28));
+    g.addColorStop(0.6, "rgba(13,18,51,0.92)");
+    g.addColorStop(1, "rgba(6,9,30,0.96)");
     ctx.fillStyle = g;
     ctx.fill();
     ctx.strokeStyle = Utils.rgba(base, 0.4);
@@ -1124,7 +1113,7 @@ const Renderer = (() => {
 
   function drawReels(t) {
     const { cell } = layout;
-    // frame backdrop
+    const { reels, rows } = CONFIG.GRID;
     ctx.save();
     roundRect(layout.frameX, layout.frameY, layout.frameW, layout.frameH, cell * 0.16);
     const bg = ctx.createLinearGradient(0, layout.frameY, 0, layout.frameY + layout.frameH);
@@ -1133,14 +1122,13 @@ const Renderer = (() => {
     bg.addColorStop(1, "rgba(12,17,48,0.92)");
     ctx.fillStyle = bg;
     ctx.fill();
-    ctx.strokeStyle = "rgba(242,200,109,0.5)";
+    ctx.strokeStyle = "rgba(245,201,107,0.5)";
     ctx.lineWidth = 2;
     ctx.stroke();
-    ctx.strokeStyle = "rgba(242,200,109,0.14)";
+    ctx.strokeStyle = "rgba(245,201,107,0.13)";
     ctx.lineWidth = 1;
     roundRect(layout.frameX - 5, layout.frameY - 5, layout.frameW + 10, layout.frameH + 10, cell * 0.19);
     ctx.stroke();
-    // corner stars
     ctx.fillStyle = "rgba(255,233,173,0.9)";
     for (const [cx, cy] of [
       [layout.frameX, layout.frameY],
@@ -1151,26 +1139,23 @@ const Renderer = (() => {
       ctx.save();
       ctx.translate(cx, cy);
       ctx.rotate(Math.PI / 4);
-      const s = 5;
-      ctx.fillRect(-s / 2, -s / 2, s, s);
+      ctx.fillRect(-2.5, -2.5, 5, 5);
       ctx.restore();
     }
     ctx.restore();
 
-    // columns
-    for (let c = 0; c < ReelEngine.reels; c++) {
+    for (let c = 0; c < reels; c++) {
       const col = ReelEngine.view[c];
       const x0 = layout.ox + c * cell;
       ctx.save();
       ctx.beginPath();
-      ctx.rect(x0 + 1, layout.oy - cell * 0.1, cell - 2, layout.gridH + cell * 0.2);
+      ctx.rect(x0 + 1, layout.oy - cell * 0.08, cell - 2, layout.gridH + cell * 0.16);
       ctx.clip();
 
       if (col.mode === "spin") {
-        // scrolling strip with motion smear
         const n = col.spinSymbols.length;
         const speedBlur = qual.blur ? Utils.clamp(col.spinSpeed / 20, 0, 1) : 0;
-        for (let k = -1; k < 4; k++) {
+        for (let k = -1; k < rows + 1; k++) {
           const idx = ((Math.floor(col.spinOffset) + k) % n + n) % n;
           const frac = col.spinOffset - Math.floor(col.spinOffset);
           const y = layout.oy + (k - frac) * cell;
@@ -1178,7 +1163,7 @@ const Renderer = (() => {
           ctx.globalAlpha = 1;
           drawChip(x0, y, cell, sym);
           const gsize = cell * 0.52;
-          const color = TIER_COLORS[SYMBOL_BY_ID[sym].element];
+          const color = (SYMBOL_BY_ID[sym] && SYMBOL_BY_ID[sym].color) || "#9fd8ff";
           if (speedBlur > 0.25) {
             ctx.globalAlpha = 0.35;
             drawGlyph(ctx, sym, x0 + cell / 2, y + cell / 2 - cell * 0.16 * speedBlur, gsize, color, 0);
@@ -1188,17 +1173,14 @@ const Renderer = (() => {
           drawGlyph(ctx, sym, x0 + cell / 2, y + cell / 2, gsize, color, qual.glow ? 6 : 0);
         }
         ctx.globalAlpha = 1;
-        // vertical speed streaks
-        ctx.fillStyle = `rgba(111,227,255,${0.05 * speedBlur})`;
+        ctx.fillStyle = `rgba(53,224,255,${0.05 * speedBlur})`;
         ctx.fillRect(x0 + cell * 0.2, layout.oy, cell * 0.06, layout.gridH);
         ctx.fillRect(x0 + cell * 0.7, layout.oy, cell * 0.05, layout.gridH);
       } else {
-        // idle / landed cells
-        const bob = col.cells.length ? Math.sin(t * 1.1 + c * 1.3) * 1.6 : 0;
         for (const cl of col.cells) {
           if (!cl) continue;
           const x = x0;
-          const y = layout.oy + cl.row * cell + cl.off + bob * 0.25;
+          const y = layout.oy + cl.row * cell + cl.off;
           ctx.save();
           ctx.globalAlpha = cl.alpha;
           const cx = x + cell / 2, cy = y + cell / 2;
@@ -1207,9 +1189,17 @@ const Renderer = (() => {
           ctx.translate(-cx, -cy);
           drawChip(x, y, cell, cl.sym);
           const def = SYMBOL_BY_ID[cl.sym];
-          const color = TIER_COLORS[def.element];
-          const glow = qual.glow ? 6 + cl.glow * 22 : 0;
+          const color = (def && def.color) || "#9fd8ff";
+          let extraGlow = 0;
+          if (cl.sym === "scatter") extraGlow = 0.35 + 0.3 * Math.sin(t * 3 + c * 1.7 + cl.row);
+          const glow = qual.glow ? 5 + cl.glow * 22 + extraGlow * 16 : extraGlow * 16;
           drawGlyph(ctx, cl.sym, cx, cy, cell * 0.52, color, glow);
+          if (cl.sym === "scatter") {
+            ctx.strokeStyle = Utils.rgba("#ffe9ad", 0.35 + 0.25 * Math.sin(t * 3 + c));
+            ctx.lineWidth = 1.4;
+            roundRect(x + cell * 0.07, y + cell * 0.07, cell * 0.86, cell * 0.86, cell * 0.15);
+            ctx.stroke();
+          }
           if (cl.glow > 0.02) {
             ctx.strokeStyle = Utils.rgba("#ffe9ad", 0.75 * cl.glow);
             ctx.lineWidth = 2.4;
@@ -1225,9 +1215,8 @@ const Renderer = (() => {
       }
       ctx.restore();
 
-      // column separator
       if (c > 0) {
-        ctx.strokeStyle = "rgba(242,200,109,0.1)";
+        ctx.strokeStyle = "rgba(245,201,107,0.08)";
         ctx.lineWidth = 1;
         ctx.beginPath();
         ctx.moveTo(x0, layout.oy + 4);
@@ -1236,25 +1225,23 @@ const Renderer = (() => {
       }
     }
 
-    // top/bottom inner shading
-    const sh = ctx.createLinearGradient(0, layout.oy, 0, layout.oy + cell * 0.5);
-    sh.addColorStop(0, "rgba(4,6,26,0.65)");
-    sh.addColorStop(1, "rgba(4,6,26,0)");
+    const sh = ctx.createLinearGradient(0, layout.oy, 0, layout.oy + cell * 0.4);
+    sh.addColorStop(0, "rgba(3,4,20,0.6)");
+    sh.addColorStop(1, "rgba(3,4,20,0)");
     ctx.fillStyle = sh;
-    ctx.fillRect(layout.ox, layout.oy, layout.gridW, cell * 0.5);
-    const sh2 = ctx.createLinearGradient(0, layout.oy + layout.gridH - cell * 0.5, 0, layout.oy + layout.gridH);
-    sh2.addColorStop(0, "rgba(4,6,26,0)");
-    sh2.addColorStop(1, "rgba(4,6,26,0.65)");
+    ctx.fillRect(layout.ox, layout.oy, layout.gridW, cell * 0.4);
+    const sh2 = ctx.createLinearGradient(0, layout.oy + layout.gridH - cell * 0.4, 0, layout.oy + layout.gridH);
+    sh2.addColorStop(0, "rgba(3,4,20,0)");
+    sh2.addColorStop(1, "rgba(3,4,20,0.6)");
     ctx.fillStyle = sh2;
-    ctx.fillRect(layout.ox, layout.oy + layout.gridH - cell * 0.5, layout.gridW, cell * 0.5);
+    ctx.fillRect(layout.ox, layout.oy + layout.gridH - cell * 0.4, layout.gridW, cell * 0.4);
   }
 
   function draw(t) {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    // base
     const base = ctx.createLinearGradient(0, 0, 0, H);
     base.addColorStop(0, "#05071d");
-    base.addColorStop(0.5, "#04061a");
+    base.addColorStop(0.5, "#030414");
     base.addColorStop(1, "#070a24");
     ctx.fillStyle = base;
     ctx.fillRect(0, 0, W, H);
@@ -1270,9 +1257,8 @@ const Renderer = (() => {
     ParticleEngine.draw(ctx);
     ctx.restore();
 
-    // vignette
     const v = ctx.createRadialGradient(W / 2, H * 0.45, Math.min(W, H) * 0.35, W / 2, H * 0.5, Math.max(W, H) * 0.78);
-    v.addColorStop(0, "rgba(4,6,26,0)");
+    v.addColorStop(0, "rgba(3,4,20,0)");
     v.addColorStop(1, "rgba(2,3,14,0.6)");
     ctx.fillStyle = v;
     ctx.fillRect(0, 0, W, H);
@@ -1296,8 +1282,6 @@ const PerformanceManager = (() => {
   };
   let current = { name: "AUTO", ...PRESETS.HIGH };
   let fps = 60, acc = 0, frames = 0, autoTimer = 0;
-  let autoFloor = "LOW";
-
   function detectBaseline() {
     const cores = navigator.hardwareConcurrency || 4;
     const mem = navigator.deviceMemory || 4;
@@ -1306,12 +1290,8 @@ const PerformanceManager = (() => {
     return "HIGH";
   }
   function apply(name) {
-    if (name === "AUTO") {
-      current = { name, ...PRESETS[detectBaseline()] };
-    } else if (PRESETS[name]) {
-      current = { name, ...PRESETS[name] };
-      autoFloor = name;
-    }
+    if (name === "AUTO") current = { name, ...PRESETS[detectBaseline()] };
+    else if (PRESETS[name]) current = { name, ...PRESETS[name] };
     ParticleEngine.setCap(current.particleCap);
     AmbientFX.QUALITY.starScale = current.starScale;
     AmbientFX.QUALITY.meteors = current.meteors;
@@ -1348,7 +1328,7 @@ const PerformanceManager = (() => {
 })();
 
 /* ========================================================================== *
- * MODULE: SoundManager — 100% procedural WebAudio (no binary assets).
+ * MODULE: SoundManager — procedural WebAudio.
  * ========================================================================== */
 const SoundManager = (() => {
   let ctx = null, master = null, sfx = null, music = null;
@@ -1359,9 +1339,7 @@ const SoundManager = (() => {
     if (ctx) { if (ctx.state === "suspended") ctx.resume(); return ctx; }
     try {
       ctx = new (window.AudioContext || window.webkitAudioContext)();
-      master = ctx.createGain();
-      sfx = ctx.createGain();
-      music = ctx.createGain();
+      master = ctx.createGain(); sfx = ctx.createGain(); music = ctx.createGain();
       sfx.connect(master); music.connect(master); master.connect(ctx.destination);
       applyVolumes();
     } catch (e) { console.warn("[Sound] WebAudio unavailable", e); }
@@ -1416,7 +1394,8 @@ const SoundManager = (() => {
     ui: () => tone(760, 0.07, { type: "square", gain: 0.06 }),
     denied: () => tone(140, 0.16, { type: "square", gain: 0.09, slide: 90 }),
     spinStart: () => { noise(0.5, { gain: 0.1, from: 300, to: 1900 }); tone(180, 0.3, { type: "triangle", gain: 0.08, slide: 420 }); },
-    reelStop: (i = 0) => { tone(120 - i * 8, 0.11, { type: "sine", gain: 0.22, slide: 55 }); noise(0.06, { gain: 0.05, from: 2200, to: 900 }); },
+    reelStop: (i = 0) => { tone(120 - i * 6, 0.11, { type: "sine", gain: 0.2, slide: 55 }); noise(0.06, { gain: 0.05, from: 2200, to: 900 }); },
+    tease: () => { tone(220, 0.7, { type: "sine", gain: 0.07, slide: 660 }); tone(330, 0.7, { type: "sine", gain: 0.05, slide: 990, delayT: 0.08 }); },
     win: (size = 1) => {
       if (size >= 3) arpeggio([523, 659, 784, 1046, 1318], 0.08, { type: "triangle", gain: 0.14 });
       else if (size === 2) arpeggio([523, 659, 784], 0.09, { type: "triangle", gain: 0.12 });
@@ -1451,7 +1430,7 @@ const SoundManager = (() => {
     o1.connect(f); o2.connect(f); f.connect(g); g.connect(music);
     shimmer.connect(shG); shG.connect(music);
     o1.start(); o2.start(); lfo.start(); shimmer.start(); vib.start();
-    ambientNodes = { o1, o2, lfo, shimmer, vib, g };
+    ambientNodes = { o1, o2, lfo, shimmer, vib };
   }
   function stopAmbient() {
     if (!ambientNodes) return;
@@ -1471,12 +1450,453 @@ const SoundManager = (() => {
 })();
 
 /* ========================================================================== *
+ * MODULE: AnimationEngine — GSAP presentation layer.
+ * Consumes a fully precomputed outcome; never influences math.
+ * ========================================================================== */
+const AnimationEngine = (() => {
+  function timing() {
+    const s = SettingsManager.all();
+    const auto = AutoSpinManager.isActive() ? AutoSpinManager.cfg() : null;
+    if (s.quick || (auto && auto.quick)) return { scale: 0.18, label: "quick" };
+    if (s.turbo || (auto && auto.turbo)) return { scale: 0.55, label: "turbo" };
+    return { scale: 1, label: "normal" };
+  }
+  function reduced() { return SettingsManager.get("reducedMotion"); }
+  function skipWins() {
+    const auto = AutoSpinManager.isActive() ? AutoSpinManager.cfg() : null;
+    return !!SettingsManager.get("skipAnimations") || !!(auto && auto.skipWin);
+  }
+
+  async function animateSpinTo(grid) {
+    const T = timing();
+    SoundManager.play("spinStart");
+    const stopTimes = [];
+    for (let c = 0; c < ReelEngine.reels; c++) {
+      const col = ReelEngine.view[c];
+      col.mode = "spin";
+      col.spinOffset = RNG.float() * 30;
+      stopTimes.push((0.6 + c * 0.2) * T.scale);
+      Utils.tween(col, { spinSpeed: 17 + c, duration: 0.2 + c * 0.03, ease: "power2.out" });
+    }
+    let landedScatters = 0;
+    let teased = false;
+    for (let c = 0; c < ReelEngine.reels; c++) {
+      const col = ReelEngine.view[c];
+      let wait = Math.max(0.05, stopTimes[c] - (0.2 + c * 0.03));
+      // Scatter anticipation: 2 landed, later reels still spinning -> suspense.
+      if (!teased && landedScatters === 2 && c >= 4 && T.label !== "quick") {
+        teased = true;
+        wait *= 1.9;
+        SoundManager.play("tease");
+        for (let cc = 0; cc < c; cc++) {
+          for (const cl of ReelEngine.view[cc].cells) {
+            if (cl && cl.sym === "scatter") Utils.tween(cl, { glow: 1, duration: 0.26, yoyo: true, repeat: 3, ease: "sine.inOut" });
+          }
+        }
+      }
+      await Utils.wait(wait * 1000);
+      await Utils.tween(col, { spinSpeed: 0, duration: 0.3 * T.scale, ease: "power3.out" });
+      col.mode = "idle";
+      col.cells = grid[c].map((sym, r) => ({ sym, row: r, off: -Renderer.frameGeometry().cell * 0.7, scale: 1, alpha: 1, glow: 0 }));
+      for (const cl of col.cells) Utils.tween(cl, { off: 0, duration: 0.3 * T.scale, ease: "back.out(2.2)" });
+      SoundManager.play("reelStop", c);
+      if (!reduced()) Renderer.addShake(2);
+      landedScatters += grid[c].filter((s) => s === "scatter").length;
+      EventBus.emit(EVENTS.REEL_STOPPED, { reel: c });
+    }
+    await Utils.wait(90 * T.scale);
+  }
+
+  async function animateWin(step) {
+    const T = timing();
+    const ev = step.eval;
+    const cells = [];
+    for (const key of ev.winCells) {
+      const [c, r] = key.split(",").map(Number);
+      const cell = ReelEngine.cellAt(c, r);
+      if (cell) cells.push(cell);
+    }
+    const size = step.amount >= 10 * GameState.data.currentBet ? 3 : step.amount >= 4 * GameState.data.currentBet ? 2 : 1;
+    SoundManager.play("win", size);
+    const pulse = { v: 0 };
+    const pulseUp = Utils.tween(pulse, {
+      v: 1, duration: 0.24 * T.scale, ease: "power2.out", repeat: T.label === "quick" ? 0 : 2, yoyo: true,
+      onUpdate: () => { for (const cl of cells) cl.glow = pulse.v; },
+    });
+    const geo = Renderer.frameGeometry();
+    for (const key of ev.winCells) {
+      const [c, r] = key.split(",").map(Number);
+      const p = Renderer.cellCenter(c, r);
+      const def = SYMBOL_BY_ID[step.grid[c][r]];
+      ParticleEngine.burst(p.x, p.y, (def && def.color) || "#ffe9ad", 7, { speed: 130, life: 0.7 });
+    }
+    const flashId = CONSTELLATION_IDS[RNG.int(CONSTELLATION_IDS.length)];
+    ConstellationEngine.flash(flashId, geo.ox + geo.gridW * 0.5 - geo.cell * 1.2, geo.oy - geo.cell * 0.05, geo.cell * 2.4);
+    await pulseUp;
+    for (const cl of cells) cl.glow = 0;
+  }
+
+  async function animateCascade(step) {
+    const T = timing();
+    if (!step.collapse) return;
+    const ev = step.eval;
+    EventBus.emit(EVENTS.CASCADE_STARTED, { step: step.collapse });
+    SoundManager.play("cascade");
+    const geo = Renderer.frameGeometry();
+    for (const key of ev.winCells) {
+      const [c, r] = key.split(",").map(Number);
+      const cell = ReelEngine.cellAt(c, r);
+      if (!cell) continue;
+      const p = Renderer.cellCenter(c, r);
+      const def = SYMBOL_BY_ID[cell.sym];
+      ParticleEngine.shards(p.x, p.y, (def && def.color) || "#ffe9ad", 8);
+      Utils.tween(cell, { scale: 0.05, alpha: 0, duration: 0.2 * T.scale, ease: "power2.in" });
+    }
+    await Utils.wait(210 * T.scale);
+    const moves = step.collapse.moves;
+    for (let c = 0; c < ReelEngine.reels; c++) {
+      const col = ReelEngine.view[c];
+      const colMoves = moves.filter((m) => m.col === c).sort((a, b) => a.toRow - b.toRow);
+      col.cells = colMoves.map((m) => ({
+        sym: m.symbol, row: m.toRow,
+        off: -(m.fall + (m.spawned ? 1.2 : 0)) * geo.cell,
+        scale: 1, alpha: 1, glow: 0,
+      }));
+      for (const cl of col.cells) {
+        Utils.tween(cl, { off: 0, duration: (0.3 + 0.03 * cl.row) * T.scale, ease: "bounce.out" });
+      }
+    }
+    await Utils.wait(380 * T.scale);
+    EventBus.emit(EVENTS.CASCADE_FINISHED, {});
+  }
+
+  async function animateBigWin(tierName, amount) {
+    EventBus.emit(EVENTS.BIG_WIN, { tier: tierName, amount });
+    SoundManager.play("bigWin");
+    const geo = Renderer.frameGeometry();
+    for (let i = 0; i < 5; i++) {
+      ParticleEngine.burst(
+        geo.ox + RNG.float() * geo.gridW,
+        geo.oy + RNG.float() * geo.gridH,
+        ["#ffe9ad", "#35e0ff", "#ff4fd8", "#7dffa8"][RNG.int(4)],
+        16, { speed: 220, life: 1.1 }
+      );
+    }
+    if (!reduced()) Renderer.addShake(6);
+    await UIManager.showBanner(tierName, amount);
+  }
+
+  async function animateAscension() {
+    SoundManager.play("ascension");
+    const geo = Renderer.frameGeometry();
+    for (let i = 0; i < 40; i++) {
+      ParticleEngine.stardust(geo.ox + RNG.float() * geo.gridW, geo.oy + geo.gridH, "#ffe9ad", 1);
+    }
+    UIManager.floatText("ASCENSION x5 ARMED", Renderer.W / 2 - 90, geo.oy - 44);
+    await Utils.wait(400);
+  }
+
+  async function playOutcome(outcome) {
+    const T = timing();
+    const st = GameState.data;
+    const steps = outcome.steps;
+
+    await animateSpinTo(steps[0].grid);
+    FSM.set("EVALUATING", "reels stopped");
+
+    for (let i = 0; i < steps.length; i++) {
+      const step = steps[i];
+      const ev = step.eval;
+      const hasWin = step.amount > 0;
+
+      if (i === 0 && outcome.scatter) {
+        for (const [c, r] of outcome.scatter.cells) {
+          const cell = ReelEngine.cellAt(c, r);
+          if (cell) {
+            const p = Renderer.cellCenter(c, r);
+            ParticleEngine.burst(p.x, p.y, TIER_COLORS.scatter, 12, { speed: 150, life: 0.9 });
+            Utils.tween(cell, { glow: 1, duration: 0.3, yoyo: true, repeat: 1 });
+          }
+        }
+        SoundManager.play("scatter");
+      }
+
+      if (hasWin) {
+        FSM.set("WINNING", `step ${i}`);
+        EventBus.emit(EVENTS.WIN_FOUND, { step: i, amount: step.amount, mult: step.mult, wins: ev.wins });
+        const skip = skipWins();
+        if (!skip) await animateWin(step);
+        if (step.mult > 1) {
+          EventBus.emit(EVENTS.MULTIPLIER_TRIGGERED, { mult: step.mult });
+          SoundManager.play("multiplier");
+          if (!skip) {
+            UIManager.showMultiplierBadge(step.mult);
+            await Utils.wait(260 * T.scale);
+          }
+        }
+        GameState.addBalance(step.amount);
+        st.lastWin += step.amount;
+        st.sessionScore += step.amount;
+        st.biggestWin = Math.max(st.biggestWin, step.amount);
+        st.highestMultiplier = Math.max(st.highestMultiplier, step.mult);
+        UIManager.updateHUD();
+        UIManager.flashChip("balance");
+        if (!skip) {
+          const geo = Renderer.frameGeometry();
+          const chipEl = document.querySelector("#za-balance");
+          if (chipEl) {
+            const chip = chipEl.getBoundingClientRect();
+            ParticleEngine.coinFlight(geo.ox + geo.gridW / 2, geo.oy + geo.gridH / 2, chip.left + chip.width / 2, chip.top + chip.height / 2, "#ffe9ad", T.label === "quick" ? 3 : 8);
+          }
+          UIManager.floatText(`+${step.amount.toLocaleString()}`, geo.ox + geo.gridW / 2 - 24, geo.oy - 26);
+        } else {
+          await Utils.wait(110 * T.scale);
+        }
+      }
+
+      if (step.collapse) {
+        FSM.set("CASCADING", `step ${i}`);
+        st.cascadeCount++;
+        await animateCascade(step);
+        FSM.set("EVALUATING", "cascade resolved");
+      } else {
+        break;
+      }
+    }
+
+    if (outcome.scatter) {
+      GameState.addBalance(outcome.scatter.pay);
+      st.lastWin += outcome.scatter.pay;
+      st.sessionScore += outcome.scatter.pay;
+      st.biggestWin = Math.max(st.biggestWin, outcome.scatter.pay);
+      UIManager.updateHUD();
+      UIManager.flashChip("balance");
+      const geoS = Renderer.frameGeometry();
+      UIManager.floatText(`+${outcome.scatter.pay.toLocaleString()} SCATTER`, geoS.ox + geoS.gridW / 2 - 48, geoS.oy - 26);
+    }
+
+    const bet = outcome.bet || st.currentBet;
+    outcome.bigTier = false;
+    if (outcome.totalWin > 0) {
+      const ratio = outcome.totalWin / Math.max(1, bet);
+      const tier = CONFIG.BIG_WIN_TIERS.find((t) => ratio >= t.mult);
+      outcome.bigTier = !!tier;
+      if (tier && !skipWins()) await animateBigWin(tier.name, outcome.totalWin);
+    }
+
+    return outcome;
+  }
+
+  return { playOutcome, animateSpinTo, animateWin, animateCascade, animateBigWin, animateAscension, timing, reduced, skipWins };
+})();
+
+/* ========================================================================== *
+ * MODULE: SpinEngine — the single spin pipeline. AutoSpin only repeats this.
+ * ========================================================================== */
+const SpinEngine = (() => {
+  let busy = false;
+
+  function validateSpin(isFree) {
+    const st = GameState.data;
+    if (busy) return { ok: false, reason: "busy" };
+    if (!isFree && st.balance < st.currentBet) return { ok: false, reason: "insufficient" };
+    return { ok: true };
+  }
+
+  async function spin({ free = false } = {}) {
+    if (busy) return null;
+    const isFree = free || BonusEngine.isActive();
+    const v = validateSpin(isFree);
+    if (!v.ok) {
+      if (v.reason === "insufficient") {
+        SoundManager.play("denied");
+        EventBus.emit(EVENTS.ERROR, { type: "INSUFFICIENT_BALANCE" });
+      }
+      return null;
+    }
+    if (!FSM.can("SPINNING")) return null;
+    busy = true;
+    FSM.set("SPINNING", "spin start");
+
+    const st = GameState.data;
+    if (!isFree) {
+      st.balance -= st.currentBet; // single atomic deduction
+      EventBus.emit(EVENTS.BALANCE_CHANGED, { balance: st.balance, delta: -st.currentBet });
+    }
+    st.spinsPlayed++;
+    st.lastWin = 0;
+    UIManager.updateHUD();
+    UIManager.setSpinBusy(true);
+    EventBus.emit(EVENTS.SPIN_STARTED, { bet: isFree ? 0 : st.currentBet, free: isFree });
+
+    // Math first: the ENTIRE outcome is decided here, before any animation.
+    const outcome = SlotMath.generateOutcome(isFree ? Math.max(1, st.currentBet) : st.currentBet, {
+      freeSpin: isFree,
+      ascensionArmed: st.ascensionArmed,
+    });
+    DebugTools.recordOutcome(outcome);
+
+    if (outcome.ascensionUsed) {
+      st.ascensionArmed = false;
+      UIManager.updateAscension();
+    }
+
+    try {
+      await AnimationEngine.playOutcome(outcome);
+    } catch (e) {
+      console.error("[Spin] animation failure", e);
+      EventBus.emit(EVENTS.ERROR, { type: "ANIMATION_FAILURE", detail: String(e) });
+    }
+
+    const extraCascades = Math.max(0, outcome.cascadeWins - 1);
+    chargeAscension(extraCascades + (outcome.scatter ? CONFIG.ASCENSION_PER_SCATTER : 0));
+    if (outcome.totalWin > 0) st.totalWins++;
+    if (isFree && outcome.fsMultEnd) BonusEngine.state.mult = outcome.fsMultEnd;
+    AutoSpinManager.recordOutcome({ ...outcome, free: isFree });
+
+    UIManager.setSpinBusy(false);
+    EventBus.emit(EVENTS.SPIN_RESOLVED, {
+      totalWin: outcome.totalWin, balance: st.balance, scatter: outcome.scatter, free: isFree,
+    });
+
+    busy = false;
+
+    if (outcome.scatter && !isFree) {
+      await BonusEngine.start(outcome.scatter);
+      return outcome;
+    }
+    if (!isFree) afterSpin();
+    return outcome;
+  }
+
+  function chargeAscension(n) {
+    if (n <= 0) return;
+    const st = GameState.data;
+    if (st.ascensionArmed) return;
+    st.ascensionCharge = Math.min(CONFIG.ASCENSION_CHARGES, st.ascensionCharge + n);
+    if (st.ascensionCharge >= CONFIG.ASCENSION_CHARGES) {
+      st.ascensionArmed = true;
+      st.ascensionCharge = 0;
+      st.zodiacAscensionCount++;
+      EventBus.emit(EVENTS.ASCENSION_TRIGGERED, { count: st.zodiacAscensionCount });
+      AnimationEngine.animateAscension();
+    }
+    UIManager.updateAscension();
+  }
+
+  function afterSpin() {
+    if (["NAME_ENTRY", "SUBMITTING_SCORE", "GAME_OVER", "EXIT_CONFIRMATION", "PAUSED"].includes(FSM.state)) return;
+    if (AutoSpinManager.isActive()) {
+      AutoSpinManager.onSpinDone();
+      return;
+    }
+    if (FSM.can("IDLE")) FSM.set("IDLE", "spin end");
+    if (GameState.data.balance < CONFIG.MIN_BET) GameEngine.triggerGameOver();
+  }
+
+  function userSpin() {
+    if (!UIManager.gameStarted) return;
+    const blocked = ["menu", "gameover", "name", "settings", "board", "paytable", "exit", "pause", "auto", "howto", "boot"];
+    if (blocked.some((n) => UIManager.isOverlayOpen(n))) return;
+    if (FSM.state === "PAUSED") return;
+    if (AutoSpinManager.isActive()) { AutoSpinManager.stop(); return; }
+    SoundManager.ensure();
+    spin();
+  }
+
+  function spinGap() {
+    const T = AnimationEngine.timing();
+    return Math.round(480 * T.scale);
+  }
+
+  return { spin, userSpin, afterSpin, spinGap, validateSpin };
+})();
+
+/* ========================================================================== *
+ * MODULE: AutoSpinManager — just repeats spin(); no alternate gameplay path.
+ * ========================================================================== */
+const AutoSpinManager = (() => {
+  let active = false;
+  let remaining = 0;
+  let lastOutcome = null;
+  let cfg = {
+    count: 25, turbo: false, quick: false, skipWin: false,
+    stopBelow: 0, stopAbove: 0, stopAfterBonus: true, stopAfterBigWin: false,
+  };
+
+  function start(opts = {}) {
+    if (active || !UIManager.gameStarted) return;
+    if (!FSM.can("AUTO_SPIN")) return;
+    cfg = { ...cfg, ...opts };
+    active = true;
+    remaining = cfg.count;
+    lastOutcome = null;
+    FSM.set("AUTO_SPIN", "auto start");
+    EventBus.emit(EVENTS.AUTO_SPIN_STARTED, { ...cfg });
+    UIManager.setSpinBusy(true);
+    setTimeout(() => UIManager.setSpinBusy(false), 250);
+    tick();
+  }
+  function recordOutcome(o) { lastOutcome = o; }
+  function evaluateStops() {
+    const st = GameState.data;
+    if (st.balance < st.currentBet) return "balance";
+    if (cfg.stopBelow > 0 && st.balance < cfg.stopBelow) return "balance-below";
+    if (lastOutcome) {
+      if (cfg.stopAbove > 0 && lastOutcome.totalWin >= cfg.stopAbove) return "win-above";
+      if (cfg.stopAfterBonus && lastOutcome.scatter && !lastOutcome.free) return "bonus";
+      if (cfg.stopAfterBigWin && lastOutcome.bigTier) return "big-win";
+    }
+    return null;
+  }
+  async function tick() {
+    if (!active) return;
+    const stopReason = evaluateStops();
+    if (stopReason) {
+      stop(stopReason);
+      if (stopReason === "balance") GameEngine.triggerGameOver();
+      return;
+    }
+    if (remaining !== Infinity) {
+      if (remaining <= 0) { stop("count"); return; }
+      remaining--;
+    }
+    EventBus.emit(EVENTS.AUTO_SPIN_PROGRESS, { remaining });
+    await SpinEngine.spin();
+  }
+  function onSpinDone() {
+    if (!active) { if (FSM.can("IDLE")) FSM.set("IDLE", "spin end"); return; }
+    if (BonusEngine.isActive()) return; // bonus pauses auto; resumes when bonus ends
+    setTimeout(tick, SpinEngine.spinGap());
+  }
+  function stop(reason = "user") {
+    if (!active) return;
+    active = false;
+    EventBus.emit(EVENTS.AUTO_SPIN_STOPPED, { reason });
+    if (FSM.can("IDLE")) FSM.set("IDLE", `auto stopped (${reason})`);
+  }
+  return {
+    start, stop, onSpinDone, recordOutcome,
+    isActive: () => active,
+    pause() { active = false; },
+    resumeAuto() {
+      if (active || remaining <= 0) return false;
+      active = true;
+      if (FSM.can("AUTO_SPIN")) FSM.set("AUTO_SPIN", "auto resume");
+      tick();
+      return true;
+    },
+    remaining: () => remaining,
+    cfg: () => ({ ...cfg }),
+  };
+})();
+
+/* ========================================================================== *
  * MODULE: LeaderboardService — Supabase-ready, offline-first.
- * Reads Top 50, submits scores with an idempotency key. Never deletes.
  * ========================================================================== */
 const LeaderboardService = (() => {
   let client = null;
-  let mode = "local"; // 'online' | 'local'
+  let mode = "local";
   let cacheRows = null;
 
   function seedLocalBoard() {
@@ -1542,7 +1962,7 @@ const LeaderboardService = (() => {
         if (error) throw error;
         if (data && data.length) {
           cacheRows = data;
-          StorageService.write("board.cache", data); // offline cache
+          StorageService.write("board.cache", data);
           return { rows: data, source: "online" };
         }
       } catch (e) {
@@ -1552,6 +1972,16 @@ const LeaderboardService = (() => {
       if (cached && cached.length) return { rows: cached, source: "cache" };
     }
     return { rows: localBoard(), source: mode === "online" ? "cache" : "local" };
+  }
+
+  async function getTop50() {
+    try {
+      const { rows, source } = await fetchTop50();
+      return { status: rows.length ? "loaded" : "empty", rows, source };
+    } catch (e) {
+      console.warn("[Leaderboard] getTop50 error", e);
+      return { status: "error", rows: [], source: "local" };
+    }
   }
 
   function qualifies(score) {
@@ -1564,6 +1994,10 @@ const LeaderboardService = (() => {
     const rows = cacheRows || localBoard();
     for (let i = 0; i < rows.length; i++) if (score > rows[i].score) return i + 1;
     return Math.min(rows.length + 1, CONFIG.LEADERBOARD_SIZE);
+  }
+  function titleForRank(rank) {
+    for (const t of CONFIG.RANK_TITLES) if (rank <= t.max) return t.title;
+    return "ASTRAL SEEKER";
   }
 
   async function submitScore({ playerName, score, submissionId }) {
@@ -1590,7 +2024,6 @@ const LeaderboardService = (() => {
         }
       } catch (e) { console.warn("[Leaderboard] submit failed, queued locally", e); }
     }
-    // local merge always happens so the board reacts instantly (offline-first)
     const rows = localBoard();
     rows.push({ id: `local-${submissionId}`, ...entry, created_at: new Date().toISOString() });
     rows.sort((a, b) => b.score - a.score);
@@ -1607,1127 +2040,11 @@ const LeaderboardService = (() => {
     return { ok: true, online: onlineOk, rank: rankOf(score) };
   }
 
-  async function getTop50() {
-    try {
-      const { rows, source } = await fetchTop50();
-      return { status: rows.length ? "loaded" : "empty", rows, source };
-    } catch (e) {
-      console.warn("[Leaderboard] getTop50 error", e);
-      return { status: "error", rows: [], source: "local" };
-    }
-  }
-  function titleForRank(rank) {
-    for (const t of CONFIG.RANK_TITLES) if (rank <= t.max) return t.title;
-    return "ASTRAL SEEKER";
-  }
   return { init, fetchTop50, getTop50, submitScore, qualifies, rankOf, titleForRank, getMode: () => mode };
 })();
 
 /* ========================================================================== *
- * MODULE: UIManager — HUD, overlays, banners (DOM layer above the canvas).
- * ========================================================================== */
-/* Legacy stage-1 UI shell — superseded by src/ui.js (kept inert for reference). */
-const _LegacyUIManager = (() => {
-  let root = null;
-  const el = {};
-  let gameStarted = false;
-  let ascensionNodes = [];
-  let autoPopOpen = false;
-
-  const STAR_SVG = `<svg viewBox="0 0 24 24"><path d="M12 2 L14.4 9.6 L22 12 L14.4 14.4 L12 22 L9.6 14.4 L2 12 L9.6 9.6 Z" fill="currentColor"/></svg>`;
-
-  function logoSVG() {
-    return `<svg width="34" height="34" viewBox="0 0 34 34">
-      <circle cx="17" cy="17" r="15" fill="none" stroke="#f2c86d" stroke-width="1.4" opacity="0.7"/>
-      <circle cx="17" cy="17" r="10.5" fill="none" stroke="#6fe3ff" stroke-width="0.8" opacity="0.55"/>
-      <path d="M17 5 L19.2 13.4 L27.5 17 L19.2 20.6 L17 29 L14.8 20.6 L6.5 17 L14.8 13.4 Z" fill="#ffe9ad"/>
-      <circle cx="27" cy="8" r="1.6" fill="#6fe3ff"/><circle cx="7" cy="25" r="1.3" fill="#ff7ad9"/>
-    </svg>`;
-  }
-  function zodiacRingSVG() {
-    const ids = ["aries", "taurus", "gemini", "cancer", "leo", "virgo", "libra", "scorpio", "sagittarius", "capricorn", "aquarius", "pisces"];
-    let inner = `<circle cx="90" cy="90" r="86" fill="none" stroke="rgba(242,200,109,0.35)" stroke-width="1"/>`;
-    inner += `<circle cx="90" cy="90" r="62" fill="none" stroke="rgba(111,227,255,0.25)" stroke-width="0.8" stroke-dasharray="3 6"/>`;
-    ids.forEach((id, i) => {
-      const a = (i / 12) * Math.PI * 2 - Math.PI / 2;
-      const x = 90 + Math.cos(a) * 74, y = 90 + Math.sin(a) * 74;
-      const c = TIER_COLORS[SYMBOL_BY_ID[id].element];
-      inner += `<g transform="translate(${x - 9},${y - 9}) scale(0.75)">${Glyphs[id].map((p) => p.d ? `<path d="${p.d}" ${p.fill ? `fill="${c}"` : `fill="none" stroke="${c}" stroke-width="2" stroke-linecap="round"`}/>` : `<circle cx="${p.cx}" cy="${p.cy}" r="${p.r}" fill="none" stroke="${c}" stroke-width="2"/>`).join("")}</g>`;
-      inner += `<circle cx="${90 + Math.cos(a) * 86}" cy="${90 + Math.sin(a) * 86}" r="1.6" fill="#ffe9ad"/>`;
-    });
-    inner += `<path d="M90 66 L95 85 L114 90 L95 95 L90 114 L85 95 L66 90 L85 85 Z" fill="#ffe9ad" opacity="0.9"/>`;
-    return `<svg class="za-menu-zodiac" width="180" height="180" viewBox="0 0 180 180">${inner}</svg>`;
-  }
-
-  function build(container) {
-    root = container;
-    container.classList.add("za-root");
-    container.innerHTML = `
-      <canvas id="za-stage"></canvas>
-
-      <div class="za-hud-top">
-        <div class="za-logo">
-          ${logoSVG()}
-          <div>
-            <div class="za-logo-name">ZODIAC ASCENSION</div>
-            <span class="za-logo-sub">COSMIC SLOT ENGINE</span>
-          </div>
-        </div>
-        <div class="za-chips">
-          <div class="za-chip is-gold"><div class="za-chip-label">Balance</div><div class="za-chip-value" id="za-balance">100</div></div>
-          <div class="za-chip is-astral"><div class="za-chip-label">Score</div><div class="za-chip-value" id="za-score">0</div></div>
-          <div class="za-chip is-mint"><div class="za-chip-label">Last Win</div><div class="za-chip-value" id="za-lastwin">0</div></div>
-        </div>
-        <div class="za-topbtns">
-          <button class="za-iconbtn" id="za-sound" title="Sonido">${iconSound()}</button>
-          <button class="za-iconbtn" id="za-boardbtn" title="Ranking">${iconTrophy()}</button>
-          <button class="za-iconbtn" id="za-pausebtn" title="Pausa / Menú">${iconPause()}</button>
-        </div>
-      </div>
-
-      <div class="za-ascension" id="za-ascension">
-        <span class="za-asc-title">Ascension</span>
-        <div id="za-asc-nodes" style="display:flex;flex-direction:column;gap:7px;align-items:center;"></div>
-        <span class="za-asc-count" id="za-asc-count">0/12</span>
-      </div>
-
-      <div class="za-console" id="za-console">
-        <div class="za-statusline" id="za-status"></div>
-        <div class="za-cons-left">
-          <div class="za-bet">
-            <span class="za-bet-label">Bet</span>
-            <button class="za-betbtn" id="za-bet-down">−</button>
-            <span class="za-bet-value" id="za-bet">2</span>
-            <button class="za-betbtn" id="za-bet-up">+</button>
-          </div>
-          <button class="za-btn is-small" id="za-paytable">Paytable</button>
-          <button class="za-btn is-small is-ghost" id="za-exit">Exit</button>
-        </div>
-        <div class="za-spinwrap" id="za-spinwrap">
-          <svg class="za-spin-ring" viewBox="0 0 100 100">
-            <circle cx="50" cy="50" r="47" fill="none" stroke="rgba(242,200,109,0.25)" stroke-width="2" stroke-dasharray="4 9"/>
-            <circle cx="50" cy="50" r="47" fill="none" stroke="#ffe9ad" stroke-width="2.4" stroke-dasharray="60 236" stroke-linecap="round"/>
-          </svg>
-          <button class="za-spinbtn" id="za-spin">SPIN</button>
-        </div>
-        <div class="za-cons-right">
-          <div style="position:relative;">
-            <button class="za-btn is-small" id="za-auto">Auto</button>
-            <div class="za-auto-pop" id="za-autopop">
-              <button class="za-btn is-small" data-auto="10">10 Spins</button>
-              <button class="za-btn is-small" data-auto="25">25 Spins</button>
-              <button class="za-btn is-small" data-auto="50">50 Spins</button>
-              <button class="za-btn is-small" data-auto="inf">Until Stop</button>
-              <button class="za-btn is-small is-danger" data-auto="stop" style="display:none;">Stop Auto</button>
-            </div>
-          </div>
-          <button class="za-btn is-small" id="za-turbo">Turbo</button>
-          <button class="za-btn is-small" id="za-quick">Quick</button>
-          <button class="za-iconbtn" id="za-settings" title="Ajustes">${iconGear()}</button>
-        </div>
-      </div>
-
-      <div class="za-multibadge" id="za-multibadge">x2</div>
-      <div class="za-banner" id="za-banner">
-        <div class="za-banner-rays"></div>
-        <div class="za-banner-title" id="za-banner-title">BIG WIN</div>
-        <div class="za-banner-amount" id="za-banner-amount">0</div>
-      </div>
-
-      <div class="za-overlay" id="za-ov-boot">
-        <div class="za-boot">
-          <div class="za-boot-title">ZODIAC ASCENSION</div>
-          <div class="za-boot-bar"><i id="za-boot-fill"></i></div>
-          <div class="za-boot-lines" id="za-boot-lines">INITIALIZING RNG CORE…</div>
-        </div>
-      </div>
-
-      <div class="za-overlay" id="za-ov-menu">
-        <div class="za-panel" style="text-align:center;">
-          <div class="za-menu-hero">
-            ${zodiacRingSVG()}
-            <h1 class="za-menu-title">ZODIAC<br/>ASCENSION</h1>
-            <p class="za-menu-tag">Alinea los doce signos. Encadena cascadas estelares. Asciende al Top 50 cósmico.</p>
-          </div>
-          <div class="za-menu-btns">
-            <button class="za-btn is-primary" id="za-play">Enter the Zodiac</button>
-            <button class="za-btn" id="za-menu-board">Rankings · Top 50</button>
-            <button class="za-btn" id="za-menu-paytable">Paytable</button>
-            <button class="za-btn" id="za-menu-settings">Settings</button>
-          </div>
-          <div class="za-version">v${CONFIG.VERSION} · ${CONFIG.STAGE}</div>
-        </div>
-      </div>
-
-      <div class="za-overlay" id="za-ov-pause">
-        <div class="za-panel" style="max-width:420px;">
-          <div class="za-panel-kicker">System</div>
-          <h2 class="za-panel-title">Paused</h2>
-          <hr/>
-          <div style="display:flex;flex-direction:column;gap:10px;">
-            <button class="za-btn is-primary" id="za-resume">Resume</button>
-            <button class="za-btn" id="za-pause-settings">Settings</button>
-            <button class="za-btn" id="za-pause-board">Rankings</button>
-            <button class="za-btn is-danger" id="za-pause-exit">End Session</button>
-          </div>
-        </div>
-      </div>
-
-      <div class="za-overlay" id="za-ov-settings">
-        <div class="za-panel">
-          <div class="za-panel-kicker">Configuration</div>
-          <h2 class="za-panel-title">Settings</h2>
-          <hr/>
-          <div class="za-setrow">
-            <div><div class="za-setname">Graphics Quality</div><div class="za-setdesc">Never affects odds or math — visuals only.</div></div>
-            <div class="za-seg" id="za-quality-seg"></div>
-          </div>
-          <div class="za-setrow">
-            <div><div class="za-setname">Master Volume</div></div>
-            <input type="range" class="za-range" id="za-vol-master" min="0" max="100"/>
-          </div>
-          <div class="za-setrow">
-            <div><div class="za-setname">SFX Volume</div></div>
-            <input type="range" class="za-range" id="za-vol-sfx" min="0" max="100"/>
-          </div>
-          <div class="za-setrow">
-            <div><div class="za-setname">Ambience Volume</div></div>
-            <input type="range" class="za-range" id="za-vol-music" min="0" max="100"/>
-          </div>
-          <div class="za-setrow">
-            <div><div class="za-setname">Turbo Spin</div><div class="za-setdesc">~2x reel speed.</div></div>
-            <div class="za-toggle" id="za-tg-turbo"><i></i></div>
-          </div>
-          <div class="za-setrow">
-            <div><div class="za-setname">Quick Spin</div><div class="za-setdesc">Near-instant resolution.</div></div>
-            <div class="za-toggle" id="za-tg-quick"><i></i></div>
-          </div>
-          <div class="za-setrow">
-            <div><div class="za-setname">Reduced Motion</div><div class="za-setdesc">Less shake and parallax.</div></div>
-            <div class="za-toggle" id="za-tg-motion"><i></i></div>
-          </div>
-          <div class="za-setrow">
-            <div><div class="za-setname">Show FPS</div></div>
-            <div class="za-toggle" id="za-tg-fps"><i></i></div>
-          </div>
-          <hr/>
-          <div style="display:flex;gap:10px;justify-content:space-between;flex-wrap:wrap;">
-            <button class="za-btn is-ghost is-small" id="za-reset-data">Reset Local Data</button>
-            <button class="za-btn is-primary" id="za-settings-close">Close</button>
-          </div>
-        </div>
-      </div>
-
-      <div class="za-overlay" id="za-ov-board">
-        <div class="za-panel">
-          <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;">
-            <div>
-              <div class="za-panel-kicker">Hall of Stars</div>
-              <h2 class="za-panel-title">Top 50 Rankings</h2>
-            </div>
-            <span class="za-board-mode" id="za-board-mode">LOCAL</span>
-          </div>
-          <hr/>
-          <div id="za-board-body"><div class="za-board-loading">Charting star positions…</div></div>
-          <hr/>
-          <div style="display:flex;gap:10px;justify-content:space-between;align-items:center;flex-wrap:wrap;">
-            <span class="za-note" id="za-board-note"></span>
-            <div style="display:flex;gap:10px;">
-              <button class="za-btn is-small" id="za-board-refresh">Refresh</button>
-              <button class="za-btn is-primary is-small" id="za-board-close">Close</button>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div class="za-overlay" id="za-ov-paytable">
-        <div class="za-panel">
-          <div class="za-panel-kicker">Star Charts</div>
-          <h2 class="za-panel-title">Paytable</h2>
-          <p>243 ways · wins pay left to right on adjacent reels, any position. Cascades chain with rising multipliers (x1 → x10). Fill the Ascension rail to arm a x5 cosmic spin. 3+ Lunar Scatters grant 8 / 12 / 20 free spins with a persistent multiplier.</p>
-          <div class="za-pay-grid" id="za-pay-grid"></div>
-          <hr/>
-          <div style="text-align:right;"><button class="za-btn is-primary is-small" id="za-paytable-close">Close</button></div>
-        </div>
-      </div>
-
-      <div class="za-overlay" id="za-ov-exit">
-        <div class="za-panel" style="max-width:440px;text-align:center;">
-          <div class="za-panel-kicker">Exit Request</div>
-          <h2 class="za-panel-title">Abandon Ascension?</h2>
-          <p>Tu sesión actual se cerrará. Si tu puntuación clasifica, podrás registrarla en el Top 50.</p>
-          <div style="display:flex;gap:10px;justify-content:center;margin-top:14px;">
-            <button class="za-btn" id="za-exit-cancel">Resume</button>
-            <button class="za-btn is-danger" id="za-exit-confirm">End & Record</button>
-          </div>
-        </div>
-      </div>
-
-      <div class="za-overlay" id="za-ov-name">
-        <div class="za-panel" style="max-width:440px;">
-          <div class="za-panel-kicker">Leaderboard Qualified</div>
-          <h2 class="za-panel-title">Enter the Stars</h2>
-          <p>Tu puntuación clasifica para el <b id="za-name-rank" style="color:var(--gold-hi);">Top 50</b>. Escribe tu nombre de piloto:</p>
-          <input class="za-input" id="za-name-input" maxlength="14" placeholder="ORION-7" autocomplete="off"/>
-          <div class="za-note" id="za-name-note" style="margin-top:8px;"></div>
-          <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:14px;">
-            <button class="za-btn is-ghost" id="za-name-skip">Skip</button>
-            <button class="za-btn is-primary" id="za-name-submit">Submit Score</button>
-          </div>
-        </div>
-      </div>
-
-      <div class="za-overlay" id="za-ov-gameover">
-        <div class="za-panel" style="max-width:520px;text-align:center;">
-          <div class="za-panel-kicker" id="za-go-kicker">Session Complete</div>
-          <h2 class="za-panel-title" id="za-go-title">The Stars Align Anew</h2>
-          <div class="za-stats">
-            <div class="za-stat"><div class="za-stat-label">Score</div><div class="za-stat-value" id="za-go-score">0</div></div>
-            <div class="za-stat"><div class="za-stat-label">Spins</div><div class="za-stat-value" id="za-go-spins">0</div></div>
-            <div class="za-stat"><div class="za-stat-label">Biggest Win</div><div class="za-stat-value" id="za-go-big">0</div></div>
-            <div class="za-stat"><div class="za-stat-label">Max Multiplier</div><div class="za-stat-value" id="za-go-mult">x1</div></div>
-            <div class="za-stat"><div class="za-stat-label">Cascades</div><div class="za-stat-value" id="za-go-casc">0</div></div>
-            <div class="za-stat"><div class="za-stat-label">Ascensions</div><div class="za-stat-value" id="za-go-asc">0</div></div>
-          </div>
-          <div class="za-note" id="za-go-note"></div>
-          <div style="display:flex;gap:10px;justify-content:center;margin-top:16px;flex-wrap:wrap;">
-            <button class="za-btn" id="za-go-board" style="display:none;">View Rankings</button>
-            <button class="za-btn" id="za-go-name" style="display:none;">Record Score</button>
-            <button class="za-btn is-primary" id="za-go-restart">New Ascension · 100 Credits</button>
-          </div>
-        </div>
-      </div>
-
-      <div class="za-debug" id="za-debug"></div>
-    `;
-
-    // cache refs
-    for (const id of ["stage", "balance", "score", "lastwin", "bet", "spin", "spinwrap", "status", "ascension", "asc-nodes", "asc-count",
-      "auto", "autopop", "turbo", "quick", "sound", "banner", "banner-title", "banner-amount", "multibadge", "debug",
-      "ov-boot", "ov-menu", "ov-pause", "ov-settings", "ov-board", "ov-paytable", "ov-exit", "ov-name", "ov-gameover",
-      "boot-fill", "boot-lines", "board-body", "board-mode", "board-note", "pay-grid", "name-input", "name-note", "name-rank",
-      "go-score", "go-spins", "go-big", "go-mult", "go-casc", "go-asc", "go-note", "go-board", "go-name", "go-kicker", "go-title"]) {
-      el[id] = container.querySelector(`#za-${id}`);
-    }
-
-    buildAscensionNodes();
-    buildPaytable();
-    buildQualitySeg();
-    bind();
-    syncFromSettings();
-    updateHUD();
-    return el.stage;
-  }
-
-  function iconSound() { return `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H3v6h3l5 4z"/><path id="za-snd-waves" d="M15.5 8.5a5 5 0 0 1 0 7M18.5 6a9 9 0 0 1 0 12"/></svg>`; }
-  function iconTrophy() { return `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 21h8M12 17v4M7 4h10v6a5 5 0 0 1-10 0z"/><path d="M7 6H4a2 2 0 0 0 2 5M17 6h3a2 2 0 0 1-2 5"/></svg>`; }
-  function iconPause() { return `<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>`; }
-  function iconGear() { return `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.55-1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34h.09a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87v.09a1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.55 1z"/></svg>`; }
-
-  function buildAscensionNodes() {
-    const wrap = el["asc-nodes"];
-    wrap.innerHTML = "";
-    ascensionNodes = [];
-    for (let i = 0; i < CONFIG.ASCENSION_CHARGES; i++) {
-      const n = document.createElement("span");
-      n.className = "za-asc-node";
-      n.innerHTML = STAR_SVG;
-      wrap.appendChild(n);
-      ascensionNodes.push(n);
-    }
-  }
-  function buildPaytable() {
-    const grid = el["pay-grid"];
-    grid.innerHTML = "";
-    for (const s of SYMBOLS) {
-      const c = TIER_COLORS[s.element];
-      const cell = document.createElement("div");
-      cell.className = "za-pay-cell";
-      cell.style.color = c;
-      const nums = s.pay
-        ? `<span class="za-pay-nums">3× ${Utils.fmt(s.pay[3])} · 4× ${Utils.fmt(s.pay[4])} · 5× ${Utils.fmt(s.pay[5])}</span>`
-        : `<span class="za-pay-nums">3+ → Free Spins 8/12/20<br/>pay 2×/5×/25× bet</span>`;
-      cell.innerHTML = `${glyphSVG(s.id, 40, c)}<span class="za-pay-name" style="color:var(--ink);">${s.name}</span>${nums}`;
-      grid.appendChild(cell);
-    }
-  }
-  function buildQualitySeg() {
-    const seg = $("quality-seg");
-    seg.innerHTML = "";
-    for (const p of PerformanceManager.presetNames()) {
-      const b = document.createElement("button");
-      b.textContent = p;
-      b.dataset.q = p;
-      b.onclick = () => {
-        SoundManager.play("ui");
-        SettingsManager.set("quality", p);
-        PerformanceManager.apply(p);
-        syncFromSettings();
-      };
-      seg.appendChild(b);
-    }
-  }
-
-  function bind() {
-    const $ = (k) => el[k];
-    $("spin").addEventListener("click", () => SpinEngine.userSpin());
-    $("bet-down").addEventListener("click", () => changeBet(-1));
-    $("bet-up").addEventListener("click", () => changeBet(1));
-    $("auto").addEventListener("click", (e) => { e.stopPropagation(); toggleAutoPop(); });
-    el["autopop"].querySelectorAll("[data-auto]").forEach((b) => {
-      b.addEventListener("click", (e) => {
-        e.stopPropagation();
-        const v = b.dataset.auto;
-        SoundManager.play("ui");
-        if (v === "stop") AutoSpinManager.stop();
-        else AutoSpinManager.start(v === "inf" ? Infinity : parseInt(v, 10));
-        closeAutoPop();
-      });
-    });
-    document.addEventListener("click", () => closeAutoPop());
-    $("turbo").addEventListener("click", () => { SettingsManager.set("turbo", !SettingsManager.get("turbo")); syncFromSettings(); SoundManager.play("ui"); });
-    $("quick").addEventListener("click", () => { SettingsManager.set("quick", !SettingsManager.get("quick")); syncFromSettings(); SoundManager.play("ui"); });
-    $("sound").addEventListener("click", () => { SettingsManager.set("muted", !SettingsManager.get("muted")); SoundManager.applyVolumes(); syncFromSettings(); SoundManager.play("ui"); });
-    $("pausebtn").addEventListener("click", () => GameEngine.requestPause());
-    $("settings").addEventListener("click", () => { SoundManager.play("ui"); openOverlay("settings"); });
-    $("boardbtn").addEventListener("click", () => { SoundManager.play("ui"); openBoard(); });
-    $("paytable").addEventListener("click", () => { SoundManager.play("ui"); openOverlay("paytable"); });
-    $("exit").addEventListener("click", () => GameEngine.requestExit());
-
-    $("play").addEventListener("click", () => { SoundManager.play("ui"); closeOverlay("menu"); gameStarted = true; setSpinBusy(false); });
-    $("menu-board").addEventListener("click", () => { SoundManager.play("ui"); openBoard(); });
-    $("menu-paytable").addEventListener("click", () => { SoundManager.play("ui"); openOverlay("paytable"); });
-    $("menu-settings").addEventListener("click", () => { SoundManager.play("ui"); openOverlay("settings"); });
-
-    $("resume").addEventListener("click", () => { SoundManager.play("ui"); GameEngine.resume(); });
-    $("pause-settings").addEventListener("click", () => { SoundManager.play("ui"); openOverlay("settings"); });
-    $("pause-board").addEventListener("click", () => { SoundManager.play("ui"); openBoard(); });
-    $("pause-exit").addEventListener("click", () => { SoundManager.play("ui"); closeOverlay("pause"); GameEngine.requestExit(); });
-
-    $("settings-close").addEventListener("click", () => { SoundManager.play("ui"); closeOverlay("settings"); });
-    $("reset-data").addEventListener("click", () => {
-      StorageService.remove("settings"); StorageService.remove("board.submitted"); StorageService.remove("board.pending");
-      SettingsManager.reset(); SettingsManager.load();
-      syncFromSettings(); SoundManager.play("ui");
-    });
-
-    $("vol-master").addEventListener("input", (e) => { SettingsManager.set("masterVol", e.target.value / 100); SoundManager.applyVolumes(); paintRange(e.target); });
-    $("vol-sfx").addEventListener("input", (e) => { SettingsManager.set("sfxVol", e.target.value / 100); SoundManager.applyVolumes(); paintRange(e.target); });
-    $("vol-music").addEventListener("input", (e) => { SettingsManager.set("musicVol", e.target.value / 100); SoundManager.applyVolumes(); paintRange(e.target); });
-    $("tg-turbo").addEventListener("click", () => { SettingsManager.set("turbo", !SettingsManager.get("turbo")); syncFromSettings(); SoundManager.play("ui"); });
-    $("tg-quick").addEventListener("click", () => { SettingsManager.set("quick", !SettingsManager.get("quick")); syncFromSettings(); SoundManager.play("ui"); });
-    $("tg-motion").addEventListener("click", () => { SettingsManager.set("reducedMotion", !SettingsManager.get("reducedMotion")); syncFromSettings(); SoundManager.play("ui"); });
-    $("tg-fps").addEventListener("click", () => { SettingsManager.set("showFps", !SettingsManager.get("showFps")); syncFromSettings(); SoundManager.play("ui"); });
-
-    $("board-close").addEventListener("click", () => { SoundManager.play("ui"); closeOverlay("board"); });
-    $("board-refresh").addEventListener("click", () => { SoundManager.play("ui"); openBoard(); });
-    $("paytable-close").addEventListener("click", () => { SoundManager.play("ui"); closeOverlay("paytable"); });
-
-    $("exit-cancel").addEventListener("click", () => { SoundManager.play("ui"); FSM.set(AutoSpinManager.isActive() ? "AUTO_SPIN" : "IDLE", "exit cancelled"); closeOverlay("exit"); });
-    $("exit-confirm").addEventListener("click", () => { SoundManager.play("ui"); closeOverlay("exit"); GameEngine.endSession("exit"); });
-
-    $("name-submit").addEventListener("click", () => submitName());
-    $("name-skip").addEventListener("click", () => { SoundManager.play("ui"); closeOverlay("name"); showGameOver(); });
-    el["name-input"].addEventListener("keydown", (e) => { if (e.key === "Enter") submitName(); });
-
-    $("go-restart").addEventListener("click", () => { SoundManager.play("ui"); GameEngine.newSession(); });
-    $("go-board").addEventListener("click", () => { SoundManager.play("ui"); openBoard(); });
-    $("go-name").addEventListener("click", () => { SoundManager.play("ui"); showNameEntry(); });
-  }
-
-  function paintRange(input) { input.style.setProperty("--fill", `${input.value}%`); }
-
-  function changeBet(dir) {
-    if (!gameStarted || FSM.state === "SPINNING" || BonusEngine.isActive() || AutoSpinManager.isActive()) return;
-    const st = GameState.data;
-    let idx = CONFIG.BETS.indexOf(st.currentBet);
-    if (idx === -1) idx = 1;
-    idx = Utils.clamp(idx + dir, 0, CONFIG.BETS.length - 1);
-    st.currentBet = CONFIG.BETS[idx];
-    SettingsManager.set("betIndex", idx);
-    SoundManager.play("ui");
-    updateHUD();
-  }
-  function toggleAutoPop() {
-    autoPopOpen = !autoPopOpen;
-    el["autopop"].classList.toggle("is-open", autoPopOpen);
-    const stop = el["autopop"].querySelector('[data-auto="stop"]');
-    stop.style.display = AutoSpinManager.isActive() ? "inline-flex" : "none";
-  }
-  function closeAutoPop() { autoPopOpen = false; el["autopop"].classList.remove("is-open"); }
-
-  function syncFromSettings() {
-    const s = SettingsManager.all();
-    el["turbo"].classList.toggle("is-on", s.turbo);
-    el["quick"].classList.toggle("is-on", s.quick);
-    $("tg-turbo").classList.toggle("is-on", s.turbo);
-    $("tg-quick").classList.toggle("is-on", s.quick);
-    $("tg-motion").classList.toggle("is-on", s.reducedMotion);
-    $("tg-fps").classList.toggle("is-on", s.showFps);
-    $("vol-master").value = Math.round(s.masterVol * 100);
-    $("vol-sfx").value = Math.round(s.sfxVol * 100);
-    $("vol-music").value = Math.round(s.musicVol * 100);
-    for (const r of [$("vol-master"), $("vol-sfx"), $("vol-music")]) paintRange(r);
-    $("quality-seg").querySelectorAll("button").forEach((b) => b.classList.toggle("is-on", b.dataset.q === s.quality));
-    const waves = el["sound"].querySelector("#za-snd-waves");
-    if (waves) waves.style.opacity = s.muted ? 0.15 : 1;
-    el["sound"].classList.toggle("is-on", !s.muted);
-  }
-  function $(k) {
-    if (!el[k]) el[k] = root ? root.querySelector(`#za-${k}`) : null;
-    return el[k];
-  }
-
-  function updateHUD() {
-    const st = GameState.data;
-    el["balance"].textContent = Utils.fmt(st.balance);
-    el["score"].textContent = Utils.fmt(st.sessionScore);
-    el["lastwin"].textContent = Utils.fmt(st.lastWin);
-    el["bet"].textContent = st.currentBet;
-    updateAscension();
-    updateStatus();
-  }
-  const CHIP_COLORS = { balance: "#ffe9ad", score: "#6fe3ff", lastwin: "#7dffa8" };
-  function flashChip(key) {
-    const chip = el[key];
-    if (!chip) return;
-    gsap.fromTo(chip, { scale: 1.24, color: "#ffffff" }, { scale: 1, color: CHIP_COLORS[key] || "#e8ecff", duration: 0.55, ease: "back.out(3)" });
-  }
-  function updateAscension() {
-    const st = GameState.data;
-    ascensionNodes.forEach((n, i) => n.classList.toggle("is-on", i < st.ascensionCharge));
-    el["asc-count"].textContent = st.ascensionArmed ? "x5 ARMED" : `${st.ascensionCharge}/${CONFIG.ASCENSION_CHARGES}`;
-    el["ascension"].classList.toggle("is-armed", st.ascensionArmed);
-  }
-  function updateStatus() {
-    const st = GameState.data;
-    const parts = [];
-    if (BonusEngine.isActive()) parts.push(`Free Spins ${BonusEngine.state.total - BonusEngine.state.remaining}/${BonusEngine.state.total} · Mult x${BonusEngine.state.mult}`);
-    if (st.ascensionArmed) parts.push("Ascension x5 Armed");
-    const s = el["status"];
-    if (parts.length) {
-      s.textContent = parts.join("  ✦  ");
-      s.classList.add("is-visible");
-      s.classList.toggle("is-gold", st.ascensionArmed && !BonusEngine.isActive());
-    } else {
-      s.classList.remove("is-visible");
-    }
-  }
-  function setSpinBusy(busy) {
-    el["spinwrap"].classList.toggle("is-busy", busy);
-    el["spin"].disabled = busy || !gameStarted;
-  }
-
-  /* ---- overlays ---- */
-  function openOverlay(name) { el[`ov-${name}`].classList.add("is-open"); }
-  function closeOverlay(name) { el[`ov-${name}`].classList.remove("is-open"); }
-  function isOverlayOpen(name) { return el[`ov-${name}`].classList.contains("is-open"); }
-
-  async function bootSequence() {
-    openOverlay("boot");
-    const lines = ["Calibrating RNG core…", "Charting 243 ways…", "Binding constellations…", "Linking leaderboard…", "Ready"];
-    for (let i = 0; i < lines.length; i++) {
-      el["boot-lines"].textContent = lines[i];
-      el["boot-fill"].style.width = `${((i + 1) / lines.length) * 100}%`;
-      await Utils.wait(i === lines.length - 1 ? 240 : 200);
-    }
-    closeOverlay("boot");
-    openOverlay("menu");
-    el["spin"].disabled = true;
-  }
-
-  /* ---- leaderboard overlay ---- */
-  async function openBoard() {
-    openOverlay("board");
-    el["board-body"].innerHTML = `<div class="za-board-loading">Charting star positions…</div>`;
-    const { rows, source } = await LeaderboardService.fetchTop50();
-    const modeEl = el["board-mode"];
-    modeEl.textContent = source === "online" ? "ONLINE" : source === "cache" ? "CACHED" : "LOCAL";
-    modeEl.classList.toggle("is-online", source === "online");
-    const myScore = GameState.data.sessionScore;
-    el["board-body"].innerHTML = `<div class="za-board-list">${rows.map((r, i) => `
-      <div class="za-board-row ${myScore > 0 && myScore === r.score ? "" : ""}">
-        <span class="za-board-rank">${i + 1}</span>
-        <span class="za-board-name">${escapeHtml(r.player_name)}</span>
-        <span class="za-board-score">${r.score.toLocaleString()}</span>
-      </div>`).join("")}</div>`;
-    el["board-note"].textContent = source === "online"
-      ? "Synced with Supabase · RLS protected"
-      : "Offline board — scores sync when a connection is configured.";
-  }
-  function escapeHtml(s) { return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
-
-  /* ---- banners / floaters ---- */
-  function showBanner(tierName, amount) {
-    return new Promise((resolve) => {
-      el["banner-title"].textContent = tierName;
-      el["banner-amount"].textContent = "0";
-      el["banner"].classList.add("is-open");
-      const obj = { v: 0 };
-      gsap.fromTo(el["banner-title"], { scale: 2.4, opacity: 0, filter: "blur(14px)" }, { scale: 1, opacity: 1, filter: "blur(0px)", duration: 0.45, ease: "back.out(2)" });
-      gsap.to(obj, {
-        v: amount, duration: 1.1, delay: 0.25, ease: "power1.out",
-        onUpdate: () => { el["banner-amount"].textContent = Math.round(obj.v).toLocaleString(); SoundManager.play("coin"); },
-        onComplete: () => {
-          gsap.to(el["banner"], { opacity: 0, duration: 0.4, delay: 0.5, onComplete: () => {
-            el["banner"].classList.remove("is-open");
-            gsap.set(el["banner"], { opacity: 1 });
-            resolve();
-          } });
-        },
-      });
-    });
-  }
-  function showMultiplierBadge(mult) {
-    const geo = Renderer.frameGeometry();
-    const badge = el["multibadge"];
-    badge.textContent = `x${mult}`;
-    badge.style.left = `${geo.ox + geo.gridW - 10}px`;
-    badge.style.top = `${geo.oy - 26}px`;
-    gsap.fromTo(badge, { opacity: 0, scale: 0.4, y: 14 }, { opacity: 1, scale: 1, y: 0, duration: 0.28, ease: "back.out(3)" });
-    gsap.to(badge, { opacity: 0, scale: 1.25, duration: 0.3, delay: 0.75, ease: "power2.in" });
-    if (!SettingsManager.get("reducedMotion")) Renderer.addShake(3);
-  }
-  function floatText(text, x, y) {
-    const f = document.createElement("div");
-    f.className = "za-floater";
-    f.textContent = text;
-    f.style.left = `${x}px`;
-    f.style.top = `${y}px`;
-    root.appendChild(f);
-    gsap.fromTo(f, { opacity: 0, y: 10, scale: 0.8 }, { opacity: 1, y: -26, scale: 1, duration: 0.9, ease: "power2.out", onComplete: () => f.remove() });
-    gsap.to(f, { opacity: 0, delay: 0.65, duration: 0.3 });
-  }
-  async function showBonusGrant(scatter) {
-    floatText(`+${scatter.pay} SCATTER PAY`, Renderer.W / 2 - 70, Renderer.frameGeometry().oy - 40);
-    const s = el["status"];
-    s.textContent = `Ascension Granted — ${scatter.spins} Free Spins`;
-    s.classList.add("is-visible");
-    await Utils.wait(SettingsManager.get("quick") ? 500 : 1300);
-  }
-  async function showBonusSummary(totalWon) {
-    const s = el["status"];
-    s.textContent = `Free Spins Complete — Won ${totalWon}`;
-    s.classList.add("is-visible");
-    SoundManager.play("win", 2);
-    await Utils.wait(SettingsManager.get("quick") ? 600 : 1600);
-    s.classList.remove("is-visible");
-  }
-
-  /* ---- end-of-session flows ---- */
-  function showNameEntry() {
-    const st = GameState.data;
-    el["name-rank"].textContent = `#${LeaderboardService.rankOf(st.sessionScore)} on the charts`;
-    el["name-input"].value = SettingsManager.get("playerName") || "";
-    el["name-note"].textContent = "";
-    closeOverlay("gameover");
-    openOverlay("name");
-    FSM.set("NAME_ENTRY", "name entry");
-    setTimeout(() => el["name-input"].focus(), 50);
-  }
-  async function submitName() {
-    const name = (el["name-input"].value || "").trim();
-    if (name.length < 2) {
-      el["name-note"].textContent = "Minimum 2 characters, pilot.";
-      el["name-note"].className = "za-note is-err";
-      return;
-    }
-    SettingsManager.set("playerName", name.toUpperCase());
-    FSM.set("SUBMITTING_SCORE", "submitting");
-    el["name-note"].textContent = "Transmitting to the stars…";
-    el["name-note"].className = "za-note";
-    const st = GameState.data;
-    const res = await LeaderboardService.submitScore({
-      playerName: name, score: st.sessionScore, submissionId: `${st.sessionId}`,
-    });
-    SoundManager.play("submit");
-    el["name-note"].textContent = res.online
-      ? `Recorded online · Rank #${res.rank}`
-      : `Recorded locally · Rank #${res.rank} (syncs when online)`;
-    el["name-note"].className = "za-note is-ok";
-    await Utils.wait(900);
-    closeOverlay("name");
-    showGameOver(true);
-  }
-  function showGameOver(submitted = false) {
-    const st = GameState.data;
-    FSM.set("GAME_OVER", "game over shown");
-    const broke = st.balance < CONFIG.MIN_BET;
-    el["go-kicker"].textContent = broke ? "Out of Credits" : "Session Closed";
-    el["go-title"].textContent = broke ? "The Void Claims All" : "The Stars Align Anew";
-    el["go-score"].textContent = st.sessionScore.toLocaleString();
-    el["go-spins"].textContent = st.spinsPlayed;
-    el["go-big"].textContent = st.biggestWin.toLocaleString();
-    el["go-mult"].textContent = `x${st.highestMultiplier}`;
-    el["go-casc"].textContent = st.cascadeCount;
-    el["go-asc"].textContent = st.zodiacAscensionCount;
-    const qualified = LeaderboardService.qualifies(st.sessionScore);
-    el["go-board"].style.display = "inline-flex";
-    el["go-name"].style.display = qualified && !submitted ? "inline-flex" : "none";
-    el["go-note"].textContent = submitted
-      ? "Your score is on the charts. A new ascension awaits."
-      : qualified
-        ? "You qualify for the Top 50. Record your name among the stars."
-        : `Reach ${CONFIG.LEADERBOARD_SIZE > 0 ? "the Top 50" : "the charts"} — current threshold: ${(LeaderboardService.qualifies(1) ? "any score" : "beat the 50th star")}.`;
-    SoundManager.play("gameOver");
-    openOverlay("gameover");
-  }
-
-  return {
-    build, updateHUD, flashChip, updateAscension, updateStatus, setSpinBusy,
-    openOverlay, closeOverlay, isOverlayOpen, bootSequence, openBoard,
-    showBanner, showMultiplierBadge, floatText, showBonusGrant, showBonusSummary,
-    showNameEntry, submitName, showGameOver, syncFromSettings,
-    get gameStarted() { return gameStarted; },
-    get root() { return root; },
-  };
-})();
-
-/* ========================================================================== *
- * MODULE: AnimationEngine — GSAP presentation layer.
- * Consumes a fully precomputed outcome; never influences math.
- * ========================================================================== */
-const AnimationEngine = (() => {
-  function timing() {
-    const s = SettingsManager.all();
-    const auto = AutoSpinManager.isActive() ? AutoSpinManager.cfg() : null;
-    if (s.quick || (auto && auto.quick)) return { scale: 0.18, label: "quick" };
-    if (s.turbo || (auto && auto.turbo)) return { scale: 0.55, label: "turbo" };
-    return { scale: 1, label: "normal" };
-  }
-  function skipWins() {
-    const auto = AutoSpinManager.isActive() ? AutoSpinManager.cfg() : null;
-    return !!SettingsManager.get("skipAnimations") || !!(auto && auto.skipWin);
-  }
-  function reduced() { return SettingsManager.get("reducedMotion"); }
-
-  async function animateSpinTo(grid) {
-    const T = timing();
-    SoundManager.play("spinStart");
-    const stopTimes = [];
-    for (let c = 0; c < ReelEngine.reels; c++) {
-      const col = ReelEngine.view[c];
-      col.mode = "spin";
-      col.spinOffset = RNG.float() * 24;
-      const dur = 0.2 + c * 0.03;
-      stopTimes.push((0.62 + c * 0.24) * T.scale);
-      Utils.tween(col, { spinSpeed: 17 + c, duration: dur, ease: "power2.out" });
-    }
-    for (let c = 0; c < ReelEngine.reels; c++) {
-      const wait = Math.max(0.05, stopTimes[c] - (0.2 + c * 0.03));
-      await Utils.wait(wait * 1000);
-      const col = ReelEngine.view[c];
-      await Utils.tween(col, { spinSpeed: 0, duration: 0.3 * T.scale, ease: "power3.out" });
-      // land this column on its final symbols
-      col.mode = "idle";
-      col.cells = grid[c].map((sym, r) => ({ sym, row: r, off: -Renderer.frameGeometry().cell * 0.7, scale: 1, alpha: 1, glow: 0 }));
-      for (const cl of col.cells) Utils.tween(cl, { off: 0, duration: 0.3 * T.scale, ease: "back.out(2.2)" });
-      SoundManager.play("reelStop", c);
-      if (!reduced()) Renderer.addShake(2.2);
-      EventBus.emit(EVENTS.REEL_STOPPED, { reel: c });
-    }
-    await Utils.wait(90 * T.scale);
-  }
-
-  async function animateWin(step, stepIndex, totalSteps) {
-    const T = timing();
-    const ev = step.eval;
-    // glow pulse on winning cells
-    const cells = [];
-    for (const key of ev.winCells) {
-      const [c, r] = key.split(",").map(Number);
-      const cell = ReelEngine.cellAt(c, r);
-      if (cell) cells.push(cell);
-    }
-    const size = step.amount >= 10 * GameState.data.currentBet ? 3 : step.amount >= 4 * GameState.data.currentBet ? 2 : 1;
-    SoundManager.play("win", size);
-    const pulse = { v: 0 };
-    const pulseUp = Utils.tween(pulse, { v: 1, duration: 0.24 * T.scale, ease: "power2.out", repeat: T.label === "quick" ? 0 : 2, yoyo: true,
-      onUpdate: () => { for (const cl of cells) cl.glow = pulse.v; } });
-    // constellation flash + particles at each winning cell
-    const geo = Renderer.frameGeometry();
-    for (const key of ev.winCells) {
-      const [c, r] = key.split(",").map(Number);
-      const p = Renderer.cellCenter(c, r);
-      const def = SYMBOL_BY_ID[step.grid[c][r]] || SYMBOL_BY_ID[ev.wins[0]?.symbol || "leo"];
-      ParticleEngine.burst(p.x, p.y, TIER_COLORS[def ? def.element : "fire"], 8, { speed: 130, life: 0.7 });
-    }
-    const firstWin = ev.wins[0];
-    if (firstWin && CONSTELLATIONS[firstWin.symbol]) {
-      ConstellationEngine.flash(firstWin.symbol, geo.ox + geo.gridW * 0.5 - geo.cell * 1.2, geo.oy - geo.cell * 0.05, geo.cell * 2.4);
-    }
-    await pulseUp;
-    for (const cl of cells) cl.glow = 0;
-  }
-
-  async function animateCascade(step) {
-    const T = timing();
-    if (!step.collapse) return;
-    const ev = step.eval;
-    EventBus.emit(EVENTS.CASCADE_STARTED, { step: step.collapse });
-    SoundManager.play("cascade");
-    const geo = Renderer.frameGeometry();
-    // explode removed cells
-    for (const key of ev.winCells) {
-      const [c, r] = key.split(",").map(Number);
-      const cell = ReelEngine.cellAt(c, r);
-      if (!cell) continue;
-      const p = Renderer.cellCenter(c, r);
-      const def = SYMBOL_BY_ID[cell.sym];
-      ParticleEngine.shards(p.x, p.y, TIER_COLORS[def.element], 9);
-      Utils.tween(cell, { scale: 0.05, alpha: 0, duration: 0.2 * T.scale, ease: "power2.in" });
-    }
-    await Utils.wait(210 * T.scale);
-    // rebuild columns: survivors fall, spawns drop in
-    const moves = step.collapse.moves;
-    for (let c = 0; c < ReelEngine.reels; c++) {
-      const col = ReelEngine.view[c];
-      const colMoves = moves.filter((m) => m.col === c).sort((a, b) => a.toRow - b.toRow);
-      col.cells = colMoves.map((m) => ({
-        sym: m.symbol, row: m.toRow,
-        off: -(m.fall + (m.spawned ? 1.2 : 0)) * geo.cell,
-        scale: 1, alpha: 1, glow: 0,
-      }));
-      for (const cl of col.cells) {
-        Utils.tween(cl, { off: 0, duration: (0.32 + 0.03 * cl.row) * T.scale, ease: "bounce.out" });
-      }
-    }
-    await Utils.wait(400 * T.scale);
-    EventBus.emit(EVENTS.CASCADE_FINISHED, {});
-  }
-
-  async function animateBigWin(tierName, amount) {
-    EventBus.emit(EVENTS.BIG_WIN, { tier: tierName, amount });
-    SoundManager.play("bigWin");
-    const geo = Renderer.frameGeometry();
-    for (let i = 0; i < 5; i++) {
-      ParticleEngine.burst(
-        geo.ox + RNG.float() * geo.gridW,
-        geo.oy + RNG.float() * geo.gridH,
-        Utils.pick(["#ffe9ad", "#6fe3ff", "#ff7ad9", "#7dffa8"], RNG.float.bind(RNG)),
-        16, { speed: 220, life: 1.1 }
-      );
-    }
-    if (!reduced()) Renderer.addShake(6);
-    await UIManager.showBanner(tierName, amount);
-  }
-
-  async function animateAscension() {
-    SoundManager.play("ascension");
-    const geo = Renderer.frameGeometry();
-    for (let i = 0; i < 40; i++) {
-      ParticleEngine.stardust(geo.ox + RNG.float() * geo.gridW, geo.oy + geo.gridH, "#ffe9ad", 1);
-    }
-    UIManager.floatText("ASCENSION x5 ARMED", Renderer.W / 2 - 90, geo.oy - 44);
-    await Utils.wait(400);
-  }
-
-  async function playOutcome(outcome) {
-    const T = timing();
-    const st = GameState.data;
-    const steps = outcome.steps;
-
-    await animateSpinTo(steps[0].grid);
-    FSM.set("EVALUATING", "reels stopped");
-
-    for (let i = 0; i < steps.length; i++) {
-      const step = steps[i];
-      const ev = step.eval;
-      const hasWin = step.amount > 0;
-
-      if (i === 0 && outcome.scatter) {
-        // scatter flash (triggers bonus after cascades resolve)
-        for (const [c, r] of outcome.scatter.cells) {
-          const cell = ReelEngine.cellAt(c, r);
-          if (cell) {
-            const p = Renderer.cellCenter(c, r);
-            ParticleEngine.burst(p.x, p.y, TIER_COLORS.scatter, 12, { speed: 150, life: 0.9 });
-            Utils.tween(cell, { glow: 1, duration: 0.3, yoyo: true, repeat: 1 });
-          }
-        }
-        SoundManager.play("scatter");
-      }
-
-      if (hasWin) {
-        FSM.set("WINNING", `step ${i}`);
-        EventBus.emit(EVENTS.WIN_FOUND, { step: i, amount: step.amount, mult: step.mult, wins: ev.wins });
-        const skip = skipWins();
-        if (!skip) await animateWin(step, i, steps.length);
-        if (step.mult > 1) {
-          EventBus.emit(EVENTS.MULTIPLIER_TRIGGERED, { mult: step.mult });
-          SoundManager.play("multiplier");
-          if (!skip) {
-            UIManager.showMultiplierBadge(step.mult);
-            await Utils.wait(260 * T.scale);
-          }
-        }
-        // apply winnings for this step immediately (balance feedback)
-        GameState.addBalance(step.amount);
-        st.lastWin += step.amount;
-        st.sessionScore += step.amount;
-        st.biggestWin = Math.max(st.biggestWin, step.amount);
-        st.highestMultiplier = Math.max(st.highestMultiplier, step.mult);
-        UIManager.updateHUD();
-        UIManager.flashChip("balance");
-        if (!skip) {
-          const geo = Renderer.frameGeometry();
-          const chipEl = document.querySelector("#za-balance");
-          if (chipEl) {
-            const chip = chipEl.getBoundingClientRect();
-            ParticleEngine.coinFlight(geo.ox + geo.gridW / 2, geo.oy + geo.gridH / 2, chip.left + chip.width / 2, chip.top + chip.height / 2, "#ffe9ad", T.label === "quick" ? 3 : 8);
-          }
-          UIManager.floatText(`+${step.amount.toLocaleString()}`, geo.ox + geo.gridW / 2 - 24, geo.oy - 30);
-        } else {
-          await Utils.wait(110 * T.scale);
-        }
-      }
-
-      if (step.collapse) {
-        FSM.set("CASCADING", `step ${i}`);
-        st.cascadeCount++;
-        await animateCascade(step);
-        FSM.set("EVALUATING", "cascade resolved");
-      } else {
-        break;
-      }
-    }
-
-    // scatter pay + bonus trigger
-    if (outcome.scatter) {
-      GameState.addBalance(outcome.scatter.pay);
-      st.lastWin += outcome.scatter.pay;
-      st.sessionScore += outcome.scatter.pay;
-      st.biggestWin = Math.max(st.biggestWin, outcome.scatter.pay);
-      UIManager.updateHUD();
-      UIManager.flashChip("balance");
-      const geoS = Renderer.frameGeometry();
-      UIManager.floatText(`+${outcome.scatter.pay.toLocaleString()} SCATTER`, geoS.ox + geoS.gridW / 2 - 48, geoS.oy - 30);
-    }
-
-    // big win banner
-    const bet = outcome.bet || st.currentBet;
-    outcome.bigTier = false;
-    if (outcome.totalWin > 0) {
-      const ratio = outcome.totalWin / Math.max(1, bet);
-      const tier = CONFIG.BIG_WIN_TIERS.find((t) => ratio >= t.mult);
-      outcome.bigTier = !!tier;
-      if (tier && !skipWins()) await animateBigWin(tier.name, outcome.totalWin);
-    }
-
-    return outcome;
-  }
-
-  return { playOutcome, animateSpinTo, animateWin, animateCascade, animateBigWin, animateAscension, timing, reduced };
-})();
-
-/* ========================================================================== *
- * MODULE: SpinEngine — orchestrates the spin pipeline.
- * ========================================================================== */
-const SpinEngine = (() => {
-  let busy = false;
-
-  function validateSpin(isFree) {
-    const st = GameState.data;
-    if (busy) return { ok: false, reason: "busy" };
-    if (!isFree && st.balance < st.currentBet) return { ok: false, reason: "insufficient" };
-    return { ok: true };
-  }
-
-  async function spin({ free = false } = {}) {
-    if (busy) return null; // hard guard against double execution
-    const isFree = free || BonusEngine.isActive();
-    const v = validateSpin(isFree);
-    if (!v.ok) {
-      if (v.reason === "insufficient") {
-        SoundManager.play("denied");
-        EventBus.emit(EVENTS.ERROR, { type: "INSUFFICIENT_BALANCE" });
-      }
-      return null;
-    }
-    const targetState = "SPINNING";
-    if (!FSM.can(targetState)) return null;
-    busy = true;
-    FSM.set(targetState, "spin start");
-
-    const st = GameState.data;
-    if (!isFree) {
-      st.balance -= st.currentBet; // single, atomic deduction
-      EventBus.emit(EVENTS.BALANCE_CHANGED, { balance: st.balance, delta: -st.currentBet });
-    }
-    st.spinsPlayed++;
-    st.lastWin = 0;
-    UIManager.updateHUD();
-    UIManager.setSpinBusy(true);
-    EventBus.emit(EVENTS.SPIN_STARTED, { bet: isFree ? 0 : st.currentBet, free: isFree });
-
-    // Math first: the entire outcome is decided here, before any animation.
-    const outcome = SlotMath.generateOutcome(isFree ? Math.max(1, st.currentBet) : st.currentBet, {
-      freeSpin: isFree,
-      fsMult: BonusEngine.state.mult,
-      ascensionArmed: st.ascensionArmed,
-    });
-    DebugTools.recordOutcome(outcome);
-
-    if (outcome.ascensionUsed) {
-      st.ascensionArmed = false;
-      UIManager.updateAscension();
-    }
-
-    try {
-      await AnimationEngine.playOutcome(outcome);
-    } catch (e) {
-      console.error("[Spin] animation failure", e);
-      EventBus.emit(EVENTS.ERROR, { type: "ANIMATION_FAILURE", detail: String(e) });
-    }
-
-    // stats & ascension charging
-    const extraCascades = Math.max(0, outcome.cascadeWins - 1);
-    chargeAscension(extraCascades + (outcome.scatter ? CONFIG.ASCENSION_PER_SCATTER : 0));
-    if (outcome.totalWin > 0) st.totalWins++;
-    if (isFree && outcome.fsMultEnd) BonusEngine.state.mult = outcome.fsMultEnd;
-    AutoSpinManager.recordOutcome({ ...outcome, free: isFree });
-
-    UIManager.setSpinBusy(false);
-    EventBus.emit(EVENTS.SPIN_RESOLVED, {
-      totalWin: outcome.totalWin, balance: st.balance, scatter: outcome.scatter, free: isFree,
-    });
-
-    busy = false;
-
-    // bonus trigger (after cascade resolution, classic order)
-    if (outcome.scatter && !isFree) {
-      await BonusEngine.start(outcome.scatter);
-      return outcome;
-    }
-    if (!isFree) afterSpin();
-    return outcome;
-  }
-
-  function chargeAscension(n) {
-    if (n <= 0) return;
-    const st = GameState.data;
-    if (st.ascensionArmed) return;
-    st.ascensionCharge = Math.min(CONFIG.ASCENSION_CHARGES, st.ascensionCharge + n);
-    if (st.ascensionCharge >= CONFIG.ASCENSION_CHARGES) {
-      st.ascensionArmed = true;
-      st.ascensionCharge = 0;
-      st.zodiacAscensionCount++;
-      EventBus.emit(EVENTS.ASCENSION_TRIGGERED, { count: st.zodiacAscensionCount });
-      AnimationEngine.animateAscension();
-    }
-    UIManager.updateAscension();
-  }
-
-  function afterSpin() {
-    const st = GameState.data;
-    if (["NAME_ENTRY", "SUBMITTING_SCORE", "GAME_OVER", "EXIT_CONFIRMATION", "PAUSED"].includes(FSM.state)) return;
-    if (AutoSpinManager.isActive()) {
-      AutoSpinManager.onSpinDone();
-      return;
-    }
-    FSM.set(FSM.can("IDLE") ? "IDLE" : FSM.state, "spin end");
-    if (st.balance < CONFIG.MIN_BET) GameEngine.triggerGameOver();
-  }
-
-  function userSpin() {
-    if (!UIManager.gameStarted) return;
-    const blocked = ["menu", "gameover", "name", "settings", "board", "paytable", "exit", "pause", "auto", "howto"];
-    if (blocked.some((n) => UIManager.isOverlayOpen(n))) return;
-    if (FSM.state === "PAUSED") return;
-    if (AutoSpinManager.isActive()) { AutoSpinManager.stop(); return; }
-    SoundManager.ensure();
-    spin();
-  }
-
-  function spinGap() {
-    const T = AnimationEngine.timing();
-    return Math.round(520 * T.scale);
-  }
-
-  return { spin, userSpin, afterSpin, spinGap, validateSpin };
-})();
-
-/* ========================================================================== *
- * MODULE: AutoSpinManager
- * ========================================================================== */
-const AutoSpinManager = (() => {
-  let active = false;
-  let remaining = 0;
-  let lastOutcome = null;
-  let cfg = {
-    count: 25, turbo: false, quick: false, skipWin: false,
-    stopBelow: 0, stopAbove: 0, stopAfterBonus: true, stopAfterBigWin: false,
-  };
-
-  function start(opts = {}) {
-    if (active || !UIManager.gameStarted) return;
-    if (!FSM.can("AUTO_SPIN")) return;
-    cfg = { ...cfg, ...opts };
-    active = true;
-    remaining = cfg.count;
-    lastOutcome = null;
-    FSM.set("AUTO_SPIN", "auto start");
-    EventBus.emit(EVENTS.AUTO_SPIN_STARTED, { ...cfg });
-    UIManager.setSpinBusy(true);
-    setTimeout(() => UIManager.setSpinBusy(false), 250);
-    tick();
-  }
-  function recordOutcome(o) { lastOutcome = o; }
-  function evaluateStops() {
-    const st = GameState.data;
-    if (st.balance < st.currentBet) return "balance";
-    if (cfg.stopBelow > 0 && st.balance < cfg.stopBelow) return "balance-below";
-    if (lastOutcome) {
-      if (cfg.stopAbove > 0 && lastOutcome.totalWin >= cfg.stopAbove) return "win-above";
-      if (cfg.stopAfterBonus && lastOutcome.scatter && !lastOutcome.free) return "bonus";
-      if (cfg.stopAfterBigWin && lastOutcome.bigTier) return "big-win";
-    }
-    return null;
-  }
-  async function tick() {
-    if (!active) return;
-    const stopReason = evaluateStops();
-    if (stopReason) {
-      stop(stopReason);
-      if (stopReason === "balance") GameEngine.triggerGameOver();
-      return;
-    }
-    if (remaining !== Infinity) {
-      if (remaining <= 0) { stop("count"); return; }
-      remaining--;
-    }
-    EventBus.emit(EVENTS.AUTO_SPIN_PROGRESS, { remaining });
-    await SpinEngine.spin();
-  }
-  function onSpinDone() {
-    if (!active) { if (FSM.can("IDLE")) FSM.set("IDLE", "spin end"); return; }
-    if (BonusEngine.isActive()) return; // bonus pauses auto; it resumes when the bonus ends
-    setTimeout(tick, SpinEngine.spinGap());
-  }
-  function stop(reason = "user") {
-    if (!active) return;
-    active = false;
-    EventBus.emit(EVENTS.AUTO_SPIN_STOPPED, { reason });
-    if (FSM.can("IDLE")) FSM.set("IDLE", `auto stopped (${reason})`);
-  }
-  return {
-    start, stop, onSpinDone, recordOutcome,
-    isActive: () => active,
-    pause() { active = false; },
-    resumeAuto() {
-      if (active || remaining <= 0) return false;
-      active = true;
-      if (FSM.can("AUTO_SPIN")) FSM.set("AUTO_SPIN", "auto resume");
-      tick();
-      return true;
-    },
-    remaining: () => remaining,
-    cfg: () => ({ ...cfg }),
-  };
-})();
-
-/* ========================================================================== *
- * MODULE: DebugTools — hidden panel (CTRL+SHIFT+D) + command console.
+ * MODULE: DebugTools — CTRL+SHIFT+D panel + command console.
  * ========================================================================== */
 const DebugTools = (() => {
   let panel = null;
@@ -2741,6 +2058,7 @@ const DebugTools = (() => {
   }
   function build(container) {
     panel = container.querySelector("#za-debug");
+    if (!panel) return;
     panel.innerHTML = `
       <h4>ZODIAC DEBUG</h4>
       <div class="row"><span>FPS</span><b id="zd-fps">—</b></div>
@@ -2754,7 +2072,7 @@ const DebugTools = (() => {
       <div class="row"><span>ANIMS</span><b id="zd-anim">—</b></div>
       <div class="row"><span>QUALITY</span><b id="zd-qual">—</b></div>
       <div class="row"><span>FSM</span><b id="zd-fsm">—</b></div>
-      <input id="zd-cmd" placeholder="cmd: addcredits 500 | seed 42 | forcebonus | quality low | spin" />
+      <input id="zd-cmd" placeholder="cmd: addcredits 500 | seed 42 | forcebonus | forcewin blackhole | spin" />
     `;
     panel.querySelector("#zd-cmd").addEventListener("keydown", (e) => {
       if (e.key === "Enter") { runCommand(e.target.value); e.target.value = ""; e.stopPropagation(); }
@@ -2780,7 +2098,7 @@ const DebugTools = (() => {
   }
   function toggle() {
     open = !open;
-    panel.classList.toggle("is-open", open);
+    if (panel) panel.classList.toggle("is-open", open);
     update();
   }
   function runCommand(raw) {
@@ -2798,7 +2116,7 @@ const DebugTools = (() => {
       case "rng": RNG.configure(args[0] === "live" ? { debugMode: false } : { debugMode: true, seed: 42 }); break;
       case "forcebonus": SlotMath.setDebugForce({ type: "scatter", count: 3 }); break;
       case "forcescatter": SlotMath.setDebugForce({ type: "scatter", count: parseInt(args[0], 10) || 3 }); break;
-      case "forcewin": SlotMath.setDebugForce({ type: "symbol", symbol: args[0] || "leo" }); break;
+      case "forcewin": SlotMath.setDebugForce({ type: "symbol", symbol: args[0] || "blackhole" }); break;
       case "quality": PerformanceManager.apply((args[0] || "AUTO").toUpperCase()); break;
       case "charge": chargeDebug(parseInt(args[0], 10) || 12); break;
       case "spin": SpinEngine.userSpin(); break;
@@ -2813,8 +2131,8 @@ const DebugTools = (() => {
     st.ascensionCharge = Math.min(CONFIG.ASCENSION_CHARGES, st.ascensionCharge + n);
     if (st.ascensionCharge >= CONFIG.ASCENSION_CHARGES && !st.ascensionArmed) {
       st.ascensionArmed = true; st.ascensionCharge = 0; st.zodiacAscensionCount++;
-      UIManager.updateAscension();
-    } else UIManager.updateAscension();
+    }
+    UIManager.updateAscension();
   }
   function destroy() { if (interval) clearInterval(interval); }
   return { build, toggle, recordOutcome, destroy, isOpen: () => open };
@@ -2832,7 +2150,7 @@ const GameEngine = (() => {
   const cleanups = [];
 
   function init(container) {
-    if (running) return api; // idempotent boot (StrictMode-safe)
+    if (running) return api;
     rootEl = container;
     container.innerHTML = "";
 
@@ -2843,21 +2161,19 @@ const GameEngine = (() => {
     const canvas = UIManager.build(container);
     Renderer.init(canvas);
     ReelEngine.initStrips();
-    ReelEngine.setGrid(SlotMath.generateGrid()); // idle attract grid (visual)
+    ReelEngine.setGrid(SlotMath.generateGrid()); // idle attract grid (visual only)
     DebugTools.build(container);
     Renderer.resize();
 
-    // Event wiring (loose coupling: UI reacts to engine events)
     cleanups.push(EventBus.on(EVENTS.BALANCE_CHANGED, () => UIManager.updateHUD()));
     cleanups.push(EventBus.on(EVENTS.ERROR, (e) => console.warn("[Game]", e)));
 
-    // Input
     const onKey = (e) => {
       if (e.ctrlKey && e.shiftKey && (e.key === "D" || e.key === "d")) { e.preventDefault(); DebugTools.toggle(); return; }
       if (e.target && /INPUT|TEXTAREA/.test(e.target.tagName)) return;
       if (e.code === "Space") { e.preventDefault(); SoundManager.unlock(); SpinEngine.userSpin(); }
       if (e.key === "Escape") {
-        if (UIManager.isOverlayOpen("menu") || UIManager.isOverlayOpen("gameover") || UIManager.isOverlayOpen("name")) return;
+        if (UIManager.isOverlayOpen("gameover") || UIManager.isOverlayOpen("name")) return;
         const anyOpen = ["settings", "board", "paytable", "exit", "auto", "howto", "menu"].some((n) => UIManager.isOverlayOpen(n));
         if (anyOpen) { ["settings", "board", "paytable", "exit", "auto", "howto", "menu"].forEach((n) => UIManager.closeOverlay(n)); return; }
         requestPause();
@@ -2867,7 +2183,6 @@ const GameEngine = (() => {
     const onPointer = (e) => AmbientFX.setPointer(e.clientX / window.innerWidth, e.clientY / window.innerHeight);
     const onPointerDown = () => SoundManager.unlock();
     const onCanvasTap = (e) => {
-      // small stardust feedback wherever the player taps the cosmos
       const rect = canvas.getBoundingClientRect();
       ParticleEngine.stardust(e.clientX - rect.left, e.clientY - rect.top, "#9fd8ff", 5);
     };
@@ -2884,7 +2199,6 @@ const GameEngine = (() => {
       canvas.removeEventListener("pointerdown", onCanvasTap);
     });
 
-    // Boot
     running = true;
     ready = true;
     last = performance.now();
@@ -2904,23 +2218,21 @@ const GameEngine = (() => {
     };
     raf = requestAnimationFrame(loop);
 
-    // Async services
     LeaderboardService.init();
-    document.fonts?.ready.then(() => Renderer.resize());
+    if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => { if (running) Renderer.resize(); });
 
     UIManager.bootSequence().then(() => {
       FSM.set("IDLE", "boot complete");
       EventBus.emit(EVENTS.GAME_READY, { version: CONFIG.VERSION });
     });
 
-    window.ZODIAC = api; // debug surface
+    window.ZODIAC = api;
     return api;
   }
 
   function requestPause() {
     if (!UIManager.gameStarted) return;
     if (FSM.state === "PAUSED") { resume(); return; }
-    if (!FSM.can("PAUSED") && FSM.state !== "IDLE" && FSM.state !== "AUTO_SPIN") return;
     if (FSM.state === "AUTO_SPIN") AutoSpinManager.pause();
     if (FSM.can("PAUSED")) FSM.set("PAUSED", "user pause");
     UIManager.openOverlay("pause");
@@ -2934,7 +2246,7 @@ const GameEngine = (() => {
   }
   function requestExit() {
     if (!UIManager.gameStarted) return;
-    if (FSM.state === "SPINNING" || FSM.state === "EVALUATING" || FSM.state === "WINNING" || FSM.state === "CASCADING") {
+    if (["SPINNING", "EVALUATING", "WINNING", "CASCADING"].includes(FSM.state)) {
       SoundManager.play("denied");
       return;
     }
@@ -3013,10 +2325,11 @@ const GameEngine = (() => {
 })();
 
 export {
-  GameEngine, CONFIG, EVENTS, EventBus, Utils, GameState, FSM, SettingsManager,
-  PerformanceManager, LeaderboardService, SoundManager, ParticleEngine, Renderer,
-  SpinEngine, AutoSpinManager, BonusEngine, AnimationEngine, SlotMath, RNG,
-  ReelEngine, DebugTools, StorageService, SYMBOLS, TIER_COLORS, Glyphs, glyphSVG,
-  CONSTELLATIONS,
+  CONFIG, Utils, EventBus, EVENTS, RNG, Glyphs, TIER_COLORS, SYMBOLS, SYMBOL_BY_ID,
+  CONSTELLATIONS, CONSTELLATION_IDS, drawGlyph, glyphSVG, StorageService, SettingsManager,
+  GameState, FSM, SlotMath, WinEvaluator, CascadeEngine, MultiplierEngine, BonusEngine,
+  ReelEngine, ParticleEngine, AmbientFX, ConstellationEngine, Renderer, PerformanceManager,
+  SoundManager, AnimationEngine, SpinEngine, AutoSpinManager, LeaderboardService, DebugTools,
+  GameEngine,
 };
 export default GameEngine;

@@ -1,5 +1,5 @@
 /* ============================================================================
- * ZODIAC ASCENSION — Stage 2 Professional UI
+ * ZODIAC ASCENSION — Professional UI
  * Identity: COSMOS + ZODIAC + DESTINY + CELESTIAL POWER
  * Display: Cinzel · HUD/numbers: Orbitron · Interface: Rajdhani
  * Gold is reserved for primary actions & currency. No blanket neon.
@@ -74,7 +74,6 @@
   margin-top: 2px;
 }
 
-/* Chip set — hierarchy: WIN (center, hot) > BALANCE > BET */
 .za2-chipset { display: flex; gap: 8px; align-items: stretch; }
 .za2-chip {
   position: relative;
@@ -111,7 +110,7 @@
 .za2-hudbtns { display: flex; gap: 8px; justify-content: flex-end; }
 
 /* ========================================================================== *
- * Buttons / icon buttons
+ * Buttons
  * ========================================================================== */
 .za2-btn {
   appearance: none;
@@ -152,7 +151,6 @@
 .za2-btn.is-small { padding: 8px 12px; font-size: 12px; letter-spacing: 0.14em; }
 .za2-btn.is-wide { width: 100%; }
 .za2-btn.is-on { border-color: rgba(53, 224, 255, 0.6); color: var(--cyan); box-shadow: inset 0 0 14px rgba(53, 224, 255, 0.1), 0 0 14px rgba(53, 224, 255, 0.14); }
-.za2-btn .za2-btn-sub { font-family: var(--f-hud); font-size: 10px; opacity: 0.75; letter-spacing: 0.08em; }
 
 .za2-iconbtn {
   width: 40px; height: 40px; padding: 0;
@@ -215,7 +213,7 @@
 }
 
 /* ========================================================================== *
- * Status bar (free spins / ascension)
+ * Status bar
  * ========================================================================== */
 .za2-statusbar {
   position: absolute;
@@ -260,7 +258,6 @@
 .za2-cons-left { display: flex; align-items: center; gap: 10px; justify-content: flex-start; flex-wrap: wrap; }
 .za2-cons-right { display: flex; align-items: center; gap: 10px; justify-content: flex-end; flex-wrap: wrap; }
 
-/* Bet control */
 .za2-betbox {
   display: flex; align-items: center; gap: 10px;
   padding: 7px 12px;
@@ -411,7 +408,7 @@
 }
 
 /* ========================================================================== *
- * Toggles / segments / ranges / inputs
+ * Controls
  * ========================================================================== */
 .za2-toggle {
   width: 54px; height: 27px; position: relative; cursor: pointer; flex: none;
@@ -479,7 +476,7 @@ input[type="range"].za2-range::-moz-range-thumb { width: 14px; height: 14px; bac
 .za2-input::placeholder { color: rgba(143, 151, 201, 0.45); letter-spacing: 0.14em; }
 
 /* ========================================================================== *
- * Settings rows & tabs
+ * Settings
  * ========================================================================== */
 .za2-setrow {
   display: flex; align-items: center; justify-content: space-between; gap: 16px;
@@ -502,7 +499,7 @@ input[type="range"].za2-range::-moz-range-thumb { width: 14px; height: 14px; bac
 @keyframes za2FadeUp { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
 
 /* ========================================================================== *
- * Auto-spin modal
+ * Auto-spin
  * ========================================================================== */
 .za2-countgrid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 7px; margin: 14px 0 4px; }
 .za2-count {
@@ -545,9 +542,9 @@ input[type="range"].za2-range::-moz-range-thumb { width: 14px; height: 14px; bac
 }
 .za2-pay-cell:hover { transform: translateY(-3px); border-color: var(--gold-line-soft); box-shadow: 0 8px 24px rgba(2, 3, 12, 0.5); }
 .za2-pay-cell svg { filter: drop-shadow(0 0 7px currentColor); }
-.za2-pay-name { font-size: 11px; letter-spacing: 0.22em; font-weight: 700; color: var(--ink); text-transform: uppercase; }
+.za2-pay-name { font-size: 11px; letter-spacing: 0.22em; font-weight: 700; color: var(--ink); text-transform: uppercase; text-align: center; }
 .za2-pay-tier { font-family: var(--f-hud); font-size: 7.5px; letter-spacing: 0.3em; color: var(--muted); }
-.za2-pay-nums { font-family: var(--f-hud); font-size: 10.5px; color: var(--cyan); font-weight: 600; font-variant-numeric: tabular-nums; text-align: center; line-height: 1.6; }
+.za2-pay-nums { font-family: var(--f-hud); font-size: 10.5px; color: var(--cyan); font-weight: 600; font-variant-numeric: tabular-nums; text-align: center; line-height: 1.7; }
 .za2-multladder { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
 .za2-multchip {
   font-family: var(--f-hud); font-size: 12px; font-weight: 700; padding: 5px 11px;
@@ -618,7 +615,7 @@ input[type="range"].za2-range::-moz-range-thumb { width: 14px; height: 14px; bac
 .za2-board-state.is-error p { color: var(--danger); }
 
 /* ========================================================================== *
- * Stats grid (final summary)
+ * Final summary
  * ========================================================================== */
 .za2-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 16px 0 6px; }
 .za2-stat {

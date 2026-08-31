@@ -4,8 +4,8 @@ import { GameEngine } from "./engine";
 
 /**
  * ZODIAC ASCENSION — React shell.
- * The full game (engine, math, rendering, UI, services) lives in src/engine.js
- * as a self-contained module graph; React only provides the mount point.
+ * The full game (engine, math, rendering, UI, services) lives in src/engine.js +
+ * src/ui.js as a self-contained module graph; React only provides the mount point.
  */
 export default function App() {
   const hostRef = useRef(null);
