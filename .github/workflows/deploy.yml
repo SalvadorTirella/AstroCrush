@@ -1,11 +1,13 @@
 # ZODIAC ASCENSION — GitHub Pages deploy
-# Builds with the correct base path for https://salvadortirella.github.io/AstroCrush/
-# and publishes dist/ via GitHub Pages (Source: GitHub Actions).
+# Compila con la base correcta para https://salvadortirella.github.io/AstroCrush/
+# y publica dist/ vía GitHub Pages (Source: GitHub Actions).
+#
+# IMPORTANTE: en el repo -> Settings -> Pages -> Source debe decir "GitHub Actions".
 name: Deploy to GitHub Pages
 
 on:
   push:
-    branches: [main]
+    branches: [main, master]
   workflow_dispatch:
 
 permissions:
@@ -30,12 +32,15 @@ jobs:
           node-version: 20
           cache: npm
 
-      - name: Install
-        run: npm ci
+      - name: Install (ci with install fallback)
+        run: npm ci || npm install
 
-      # --base fixes asset URLs for the /AstroCrush/ subpath
+      # --base fija las URLs de /assets/... al subdirectorio /AstroCrush/
       - name: Build
         run: npx vite build --base=/AstroCrush/
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
